@@ -1,0 +1,1630 @@
+# -*- coding: utf-8 -*-
+"""
+Created on DreamMaker
+@author: gzliruopeng
+@date: 2025-05-19
+"""
+
+import sys
+from bpvm.Meta.TypeMeta import PImage, PStr, PFloat, PInt, PEnum, PObject, PBool, PPath, PColor, PFile, PArray
+from bpvm.Storyline.SunshineFlowNodeManager import sunshineflow_node
+from Adapters.chaiNNer.api import RegisterCategory, NodeCategory
+from SF_API import comfy_i2i, download_image, get_server_models
+from SF_Public import NparrayToBase64, ActionImageNodeBase
+from SF_Image import *
+from logger import get_logger
+
+logger = get_logger(__name__)
+
+RegisterCategory(NodeCategory("DreamMaker App", "#355fac", "BsDuffleFill", priority=45))
+
+
+def GetLoras(authinfo=None):
+    models_data = get_server_models(network_type="LORA", authinfo=authinfo)
+    enumdata = {
+        "None": "无",
+    }
+    for model in models_data:
+        if model.get("version", "") == "flux1":
+            enumdata[model["model_name"]] = model["model_name"]
+    return enumdata
+
+
+FLUX_LORA_ENUM = {
+    'None': 'None',
+    'FLUX1-超写实逼真黑悟空': '黑神话悟空',
+    'FluxLoRAGhibliStyle吉卜力美学动漫_Ghibli': '吉卜力风格',
+    'Flux_Reminiclay黏土风_v1': '粘土风格',
+    'Flux_莫奈花园_Flux_莫奈花园': '莫奈风格',
+    'Flux版_汉服风_v1': '汉服风格',
+    'BastylrV2': '二次元风格',
+}
+
+FLUX_STYLE_SELECT_ENUM = {
+    1: '硬边线稿(Shakker)',
+    2: '软边线稿(Shakker)',
+    3: '深度(Union)(Shakker)',
+    4: 'Tile(分块放大)(Shakker) ',
+    5: '姿势参考(Shakker)',
+    6: '深度(Shakker) ',
+    7: '硬边线稿(Promeai)',
+    8: '硬边线稿(TheMistoAI)',
+    9: '深度(Jasperai) ',
+    10: '模糊放大(Jasperai) ',
+    11: '法线(Jasperai) ',
+    12: '局部重绘(Alimama)',
+}
+
+
+@sunshineflow_node(PACKAGE_NAME)
+class AppFluxNode(ActionImageNodeBase):
+    NODE_TEXT = "Flux大模型"
+    NODE_ICON = "ImImages"
+    NODE_CATEGORY = "DreamMaker App"
+    KEEP_DIRTY = True
+    DESCRIPTION = "画面美学媲美MidjourneyV6，超强语义理解能力！使用更详细复杂的提示词效果更佳！另外，可使用局部重绘精确修改指定内容～"
+    INPUTS = [
+        ("flux_method", PEnum(text="出图方式", needHandle=False,
+                              staticEnum={"flux_t2i": "文生图", "flux_i2i": "图生图", "flux_inpaint": "局部重绘", },
+                              default="flux_t2i")),
+        ("prompt", PStr(text="正向提示词", default="", multiLine=True, needHandle=True)),
+        ("width",
+         PFloat(text="图片宽度", needHandle=True, min=64, max=2048, slider=True, sliderStep=64, step=64, default=1024,
+                visibleCondition='obj["flux_method"] == "flux_t2i"', )),
+        ("height",
+         PFloat(text="图片高度", needHandle=True, min=64, max=2048, slider=True, sliderStep=64, step=64, default=1472,
+                visibleCondition='obj["flux_method"] == "flux_t2i"', )),
+        ("input_image", PImage(text="上传原图", default=None, needHandle=True, optional=True, autorunRequired=True,
+                               visibleCondition='obj["flux_method"] in ["flux_i2i", "flux_inpaint"]', )),
+        ("mask", PImage(text="蒙版", default=None, needHandle=True, optional=True, autorunRequired=True,
+                        visibleCondition='obj["flux_method"] == "flux_inpaint"', )),
+        ("denoise",
+         PFloat(text="重绘幅度", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.75,
+                visibleCondition='obj["flux_method"] in ["flux_i2i", "flux_inpaint"]', )),
+        ("lora_select", PEnum(text="选择Lora", default="None", func=GetLoras, needHandle=True, porttype='string')),
+        ("lora_weight",
+         PFloat(text="Lora权重", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1)),
+        ("ref_control",
+         PEnum(text="是否需要参考与控制（ControlNet）", staticEnum={1: '是', 2: '否'}, default=2, needHandle=False,
+               porttype='number')),
+        ("style_select",
+         PEnum(text="参考和控制（ContolNet）", needHandle=True, staticEnum=FLUX_STYLE_SELECT_ENUM, default=1,
+               porttype='number', visibleCondition='obj["ref_control"] == 1', )),
+        ("ref_image", PImage(text="上传ContolNet参考图片", needHandle=True, optional=True, autorunRequired=True,
+                             visibleCondition='obj["ref_control"] == 1')),
+        ("control_strength",
+         PFloat(text="控制强度", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                visibleCondition='obj["ref_control"] == 1')),
+        ("guidance_start",
+         PFloat(text="引导介入时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0,
+                visibleCondition='obj["ref_control"] == 1')),
+        ("guidance_end",
+         PFloat(text="引导终止时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01,
+                default=0.8, visibleCondition='obj["ref_control"] == 1')),
+        ("guidance", PFloat(text="提示词引导系数", needHandle=True, min=0, max=7, slider=True, sliderStep=0.1, step=0.1,
+                            default=3.5)),
+        ("sampler_steps",
+         PFloat(text="采样步数", needHandle=True, min=0, max=50, slider=True, sliderStep=1, step=1, default=20)),
+        ("sampler", PEnum(text="采样器", needHandle=True,
+                          staticEnum={'euler': 'euler', 'ipdmn': 'ipdmn', 'uni_pc_bh2': 'uni_pc_bh2',
+                                      'dpmpp_2m': 'dpmpp_2m'}, porttype='string', default="euler")),
+        ("scheduler", PEnum(text="调度器", needHandle=True,
+                            staticEnum={'beta': 'beta', 'simple': 'simple', 'sgm_uniform': 'sgm_uniform'},
+                            porttype='string', default="beta")),
+        ("seed", PInt(text="随机种子", default=-1, min=-1, max=sys.maxsize, needHandle=True)),
+        ("image_amount",
+         PFloat(text="生成数量", needHandle=True, min=1, max=4, slider=True, sliderStep=1, step=1, default=1)),
+    ]
+    OUTPUTS = [
+        ("out_images", PObject(text="图片集合", needHandle=True, porttype='ImageSet', portkind='multi-large-image')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 拼接请求体
+        authinfo = getattr(context, "authinfo")
+        self.app_name = app_name = "flux"
+        self.sub_app_name = sub_app_name = self.flux_method
+        data = {
+            "params": {
+                "lora_select": self.lora_select,
+                "lora_weight": self.lora_weight,
+                "ref_control": self.ref_control,
+                "style_select": self.style_select,
+                "ref_image": "https://dreammaker.fp.ps.netease.com/file/66cd365ebc8d632cfb449bdbDVFToSqA05",
+                "control_strength": self.control_strength,
+                "guidance_start": self.guidance_start,
+                "guidance_end": self.guidance_end,
+                "guidance": self.guidance,
+                "sampler_steps": self.sampler_steps,
+                "sampler": self.sampler,
+                "scheduler": self.scheduler,
+                "seed": self.seed,
+                "image_amount": self.image_amount,
+            }
+        }
+        if self.ref_control == 1:
+            data["params"]["ref_image"] = NparrayToBase64(self.ref_image)
+        if sub_app_name == "flux_t2i":
+            data["params"]["t2i_prompt"] = self.prompt
+            data["params"]["width"] = self.width
+            data["params"]["height"] = self.height
+        elif sub_app_name == "flux_i2i":
+            data["params"]["i2i_prompt"] = self.prompt
+            data["params"]["input_image"] = NparrayToBase64(self.input_image)
+            data["params"]["denoise"] = self.denoise
+        elif sub_app_name == "flux_inpaint":
+            data["params"]["t2i_prompt"] = self.prompt
+            data["params"]["input_image"] = {
+                "originImg": NparrayToBase64(self.input_image),
+                "newImg": NparrayToBase64(self.mask),
+            }
+            data["params"]["denoise"] = self.denoise
+        output = comfy_i2i(app_name=app_name, sub_app_name=sub_app_name, payload=data, authinfo=authinfo, time_wait=600,
+                           blueprint_id=getattr(context, "blueprint_id"))
+        logger.info(f"[AppFluxNode] app_name: {app_name}, sub_app_name: {sub_app_name}, output: {output}")
+        out_images = []
+        if output is not None:
+            for img in output.get("images"):
+                out_images.append(download_image(img, authinfo=authinfo))
+        return {"out_images": out_images}
+
+
+@sunshineflow_node(PACKAGE_NAME)
+class AppFluxNodeNew(ActionImageNodeBase):
+    NODE_TEXT = "Flux大模型（新版）"
+    NODE_ICON = "ImImages"
+    NODE_CATEGORY = "DreamMaker App"
+    KEEP_DIRTY = True
+    DESCRIPTION = "画面美学媲美MidjourneyV6，超强语义理解能力！使用更详细复杂的提示词效果更佳！另外，可使用局部重绘精确修改指定内容～（支持 Flux-tools 和多 Lora）"
+    INPUTS = [
+        ("flux_method", PEnum(text="出图方式", needHandle=False, staticEnum={
+            "flux_t2i": "文生图",
+            "flux_i2i": "图生图",
+            "flux_inpaint": "局部重绘",
+        }, default="flux_t2i")),
+        ("prompt", PStr(text="正向提示词",
+                        default='''模仿著名美剧《绝命毒师》电影的海报。海报上有一个表情严肃的面包师，围裙上撒满了面粉，手里拿着一根擀面杖，就像武器一样。他站在一家质朴的面包店中间，周围是一堆堆的面包、糕点和一袋袋面粉，所有这些都是为了模仿原版节目中标志性的沙漠背景而布置的。在他身后，面包店的黑板菜单上列出了"Flux"和"AI"等菜品，暗示着即将展开的烹饪混乱。面包师的表情很紧张，但又严肃得滑稽，好像他要用他的面团和决心来征服这个世界。标题"DreamMaker"以粗体字显示在顶部，"DreamMaker"是一种粗糙的、有裂纹的字体，金色的字母像刚烤好的面包。。海报的整体配色是温暖的面包房色调和让人想起原剧的粗粝的暗色调，融合了《绝命毒师》的激烈戏剧的轻松、烹饪风格。''',
+                        multiLine=True, needHandle=True)),
+        ("width",
+         PFloat(text="图片宽度", needHandle=True, min=64, max=2048, slider=True, sliderStep=64, step=64, default=1024,
+                visibleCondition='obj["flux_method"] == "flux_t2i"')),
+        ("height",
+         PFloat(text="图片高度", needHandle=True, min=64, max=2048, slider=True, sliderStep=64, step=64, default=1472,
+                visibleCondition='obj["flux_method"] == "flux_t2i"')),
+        ("input_image", PImage(text="上传原图", default=None, needHandle=True, optional=True, autorunRequired=True,
+                               visibleCondition='obj["flux_method"] in ["flux_i2i", "flux_inpaint"]')),
+        ("mask", PImage(text="蒙版", default=None, needHandle=True, optional=True, autorunRequired=True,
+                        visibleCondition='obj["flux_method"] == "flux_inpaint"')),
+        ("denoise",
+         PFloat(text="重绘幅度", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.75,
+                visibleCondition='obj["flux_method"] in ["flux_i2i", "flux_inpaint"]')),
+        # 支持模型连接输入    OUTPUTS = [
+        ("model_output", PObject(text="模型输出", needHandle=True, porttype='object')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 初始化输出模型
+        output_model = {"loras": []}
+
+        # 处理所有Lora槽位
+        for i in range(1, 6):
+            lora_name = getattr(self, f"lora_select_{i}", None)
+            lora_weight = getattr(self, f"lora_weight_{i}", 1.0)
+
+            # 如果选择了有效的Lora
+            if lora_name and lora_name != "None":
+                # 添加到loras列表
+                output_model["loras"].append({
+                    "name": lora_name,
+                    "weight": lora_weight
+                })
+                logger.info(f"[FluxLoraNode] 已应用Lora #{i}: {lora_name}, 强度: {lora_weight}")
+
+        return {"model_output": output_model}        # 处理控制类型
+
+
+class FluxControlNetNode(ActionImageNodeBase):
+    NODE_TEXT = "Flux ControlNet控制"
+    NODE_ICON = "FaImage"
+    NODE_CATEGORY = "DreamMaker App"
+    DESCRIPTION = "为Flux模型提供多种ControlNet控制选项，支持多达3个普通ControlNet或一个特殊ControlNet"
+
+    # 控制模式定义
+    FLUX_CONTROL_MODES = {
+        1: "硬边线稿-2.0 ✨",
+        2: "软边线稿-2.0 ✨",
+        3: "深度-2.0 ✨",
+        4: "Tile(分块放大)(Shakker)",
+        5: "姿势参考-2.0 ✨",
+        6: "深度(Shakker)",
+        7: "硬边线稿(Promeai)",
+        8: "硬边线稿(TheMistoAI)",
+        9: "深度(Jasperai)",
+        10: "模糊放大(Jasperai)",
+        11: "法线(Jasperai)",
+        12: "局部重绘(Alimama)",
+        13: "深度-出图质量更高但不能调节强度(FluxTools)",
+        14: "硬边线稿-出图质量更高但不能调节强度(FluxTools)",
+        15: "局部重绘(FluxTools)",
+        16: "深度-出图质量正常可以调节强度(FluxTools)",
+        17: "硬边线稿-出图质量正常可以调节强度(FluxTools)"
+    }
+
+    # 基础输入
+    INPUTS = ([
+        ("control_type", PEnum(text="控制类型", staticEnum={1: "多个普通ControlNet", 2: "单个特殊ControlNet（局部重绘等）"},
+                             default=1, needHandle=True, porttype='number')),
+
+        # 多个普通ControlNet的参数
+        # 第一个ControlNet
+        ("enabled_1", PEnum(text="启用普通ControlNet #1", staticEnum={True: '是', False: '否'}, default=True, needHandle=True, porttype='boolean',
+                           visibleCondition='obj["control_type"] == 1')),
+        ("image_1", PImage(text="参考图片 #1", needHandle=True, optional=True, autorunRequired=True,
+                         visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true')),
+        ("control_mode_1", PEnum(text="控制模式 #1", needHandle=True, staticEnum=FLUX_CONTROL_MODES,
+                                porttype='number', default=3, visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true')),
+        ("control_strength_1", PFloat(text="控制强度 #1", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                                  visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true && obj["control_mode_1"] not in [13,14,15]')),
+        ("guidance_start_1", PFloat(text="引导介入时机 #1", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0,
+                                 visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true && obj["control_mode_1"] not in [13,14,15,16,17]')),
+        ("guidance_end_1", PFloat(text="引导终止时机 #1", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.8,
+                               visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true && obj["control_mode_1"] not in [13,14,15,16,17]')),
+    ])
+
+    @apps_params_check
+    def Start(self, context):
+        # 拼接请求体
+        authinfo = getattr(context, "authinfo")
+        self.app_name = app_name = "flux"
+        self.sub_app_name = sub_app_name = self.flux_method
+
+        data = {
+            "params": {
+                "guidance": self.guidance,
+                "sampler_steps": self.sampler_steps,
+                "sampler": self.sampler,
+                "scheduler": self.scheduler,
+                "seed": self.seed,
+                "image_amount": self.image_amount,
+            }
+        }
+
+        # 1. 处理Lora模型参数 - 来自model_input或UI设置
+        model_input = getattr(self, "model_input", None)
+        if model_input and isinstance(model_input, dict) and "loras" in model_input:
+            # 使用连接的模型中的loras参数
+            data["params"]["loras"] = model_input.get("loras", [])
+            logger.info(f"[AppFluxNodeNew] 使用连接的Lora模型，包含 {len(data['params']['loras'])} 个Lora")
+        else:
+            # 使用UI中的lora设置
+            loras = []
+            if hasattr(self, "lora_select") and self.lora_select != "None":
+                loras.append({"name": self.lora_select, "weight": self.lora_weight})
+            if hasattr(self, "lora_select_2") and self.lora_select_2 != "None":
+                loras.append({"name": self.lora_select_2, "weight": self.lora_weight_2})
+            if hasattr(self, "lora_select_3") and self.lora_select_3 != "None":
+                loras.append({"name": self.lora_select_3, "weight": self.lora_weight_3})
+            if loras:
+                data["params"]["loras"] = loras
+
+        # 2. 处理ControlNet参数 - 专门从control_input获取
+        control_input = getattr(self, "control_input", None)
+        if control_input and isinstance(control_input, dict):
+            # 处理普通ControlNets
+            if "controlnets" in control_input and control_input["controlnets"]:
+                data["params"]["controlnets"] = control_input["controlnets"]
+                logger.info(f"[AppFluxNodeNew] 使用连接的ControlNet，包含 {len(data['params']['controlnets'])} 个ControlNet")
+
+            # 处理特殊ref_control
+            if "ref_control" in control_input:
+                if isinstance(control_input["ref_control"], dict):
+                    data["params"]["ref_control"] = control_input["ref_control"]
+                    # 特殊处理局部重绘模式
+                    if "style_select" in control_input["ref_control"] and control_input["ref_control"]["style_select"] == 15:
+                        data["params"]["guidance"] = 30
+                else:
+                    data["params"]["ref_control"] = control_input["ref_control"]
+                logger.info(f"[AppFluxNodeNew] 使用连接的ref_control参数: {data['params'].get('ref_control')}")
+
+            # 检查是否需要覆盖guidance参数
+            if "guidance" in control_input:
+                data["params"]["guidance"] = control_input["guidance"]
+                logger.info(f"[AppFluxNodeNew] 使用控制网络提供的guidance值: {control_input['guidance']}")
+        else:
+            # 如果没有control_input，默认为不使用ControlNet
+            data["params"]["ref_control"] = 2  # 2表示"否"@sunshineflow_node(PACKAGE_NAME)
+class AppFluxNodeNew(ActionImageNodeBase):
+    NODE_TEXT = "Flux大模型（新版）"
+    NODE_ICON = "ImImages"
+    NODE_CATEGORY = "DreamMaker App"
+    KEEP_DIRTY = True
+    DESCRIPTION = "画面美学媲美MidjourneyV6，超强语义理解能力！使用更详细复杂的提示词效果更佳！另外，可使用局部重绘精确修改指定内容～（支持模型及控制网络接入）"
+    INPUTS = [
+        ("flux_method", PEnum(text="出图方式", needHandle=False, staticEnum={
+            "flux_t2i": "文生图",
+            "flux_i2i": "图生图",
+            "flux_inpaint": "局部重绘",
+        }, default="flux_t2i")),
+        ("prompt", PStr(text="正向提示词",
+                        default='''模仿著名美剧《绝命毒师》电影的海报。海报上有一个表情严肃的面包师，围裙上撒满了面粉，手里拿着一根擀面杖，就像武器一样。他站在一家质朴的面包店中间，周围是一堆堆的面包、糕点和一袋袋面粉，所有这些都是为了模仿原版节目中标志性的沙漠背景而布置的。在他身后，面包店的黑板菜单上列出了"Flux"和"AI"等菜品，暗示着即将展开的烹饪混乱。面包师的表情很紧张，但又严肃得滑稽，好像他要用他的面团和决心来征服这个世界。标题"DreamMaker"以粗体字显示在顶部，"DreamMaker"是一种粗糙的、有裂纹的字体，金色的字母像刚烤好的面包。。海报的整体配色是温暖的面包房色调和让人想起原剧的粗粝的暗色调，融合了《绝命毒师》的激烈戏剧的轻松、烹饪风格。''',
+                        multiLine=True, needHandle=True)),
+        ("width",
+         PFloat(text="图片宽度", needHandle=True, min=64, max=2048, slider=True, sliderStep=64, step=64, default=1024,
+                visibleCondition='obj["flux_method"] == "flux_t2i"')),
+        ("height",
+         PFloat(text="图片高度", needHandle=True, min=64, max=2048, slider=True, sliderStep=64, step=64, default=1472,
+                visibleCondition='obj["flux_method"] == "flux_t2i"')),
+        ("input_image", PImage(text="上传原图", default=None, needHandle=True, optional=True, autorunRequired=True,
+                               visibleCondition='obj["flux_method"] in ["flux_i2i", "flux_inpaint"]')),
+        ("mask", PImage(text="蒙版", default=None, needHandle=True, optional=True, autorunRequired=True,
+                        visibleCondition='obj["flux_method"] == "flux_inpaint"')),
+        ("denoise",
+         PFloat(text="重绘幅度", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.75,
+                visibleCondition='obj["flux_method"] in ["flux_i2i", "flux_inpaint"]')),
+
+        # 支持模型和控制网络的独立连接
+        ("model_input", PObject(text="模型输入", needHandle=True, optional=True, porttype='object',
+                             description="连接FluxLoraNode输出的模型配置")),
+        ("control_input", PObject(text="控制网络输入", needHandle=True, optional=True, porttype='object',
+                               description="连接FluxControlNetNode输出的控制网络配置")),
+
+        # 以下为直接在界面配置的Lora选项（当不使用model_input时）
+        ("lora_select", PEnum(text="选择Lora1", default="None", func=GetLoras, needHandle=True, porttype='string',
+                            visibleCondition='!obj["model_input"]')),
+        ("lora_weight",
+         PFloat(text="Lora1权重", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1,
+               visibleCondition='obj["lora_select"] != "None" && !obj["model_input"]')),
+        ("lora_select_2", PEnum(text="选择Lora2", default="None", func=GetLoras, needHandle=True, porttype='string',
+                              visibleCondition='!obj["model_input"]')),
+        ("lora_weight_2",
+         PFloat(text="Lora2权重", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1,
+                visibleCondition='obj["lora_select_2"] != "None" && !obj["model_input"]')),
+        ("lora_select_3", PEnum(text="选择Lora3", default="None", func=GetLoras, needHandle=True, porttype='string',
+                              visibleCondition='!obj["model_input"]')),
+        ("lora_weight_3",
+         PFloat(text="Lora3权重", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1,
+                visibleCondition='obj["lora_select_3"] != "None" && !obj["model_input"]')),
+
+        # 通用参数
+        ("guidance", PFloat(text="提示词引导系数", needHandle=True, min=0, max=7, slider=True, sliderStep=0.1, step=0.1,
+                            default=3.5)),
+        ("sampler_steps",
+         PFloat(text="采样步数", needHandle=True, min=0, max=50, slider=True, sliderStep=1, step=1, default=20)),
+        ("sampler", PEnum(text="采样器", needHandle=True, staticEnum={
+            'euler': 'euler',
+            'ipndm': 'ipndm',
+            'uni_pc_bh2': 'uni_pc_bh2',
+            'dpmpp_2m': 'dpmpp_2m'
+        }, porttype='string', default="euler")),
+        ("scheduler", PEnum(text="调度器", needHandle=True, staticEnum={
+            'beta': 'beta',
+            'simple': 'simple',
+            'sgm_uniform': 'sgm_uniform'
+        }, porttype='string', default="beta")),
+        ("seed", PInt(text="随机种子", default=-1, min=-1, max=sys.maxsize, needHandle=True)),
+        ("image_amount",
+         PFloat(text="生成数量", needHandle=True, min=1, max=4, slider=True, sliderStep=1, step=1, default=1)),
+    ]
+        ("model_input", PObject(text="模型输入", needHandle=True, optional=True, porttype='object',
+                             description="连接FluxLoraNode或FluxControlNetNode的输出")),
+        ("ref_control",
+         PEnum(text="是否需要参考与控制（ControlNet）", staticEnum={1: '是', 2: '否'}, default=2, needHandle=False,
+               porttype='number', visibleCondition='!obj["model_input"]')),
+        ("style_select", PEnum(text="参考和控制（ContolNet）", needHandle=True, staticEnum={
+            1: "硬边线稿-2.0 ✨",
+            2: "软边线稿-2.0 ✨",
+            3: "深度-2.0 ✨",
+            4: "Tile(分块放大)(Shakker)",
+            5: "姿势参考-2.0 ✨",
+            6: "深度(Shakker)",
+            7: "硬边线稿(Promeai)",
+            8: "硬边线稿(TheMistoAI)",
+            9: "深度(Jasperai)",
+            10: "模糊放大(Jasperai)",
+            11: "法线(Jasperai)",
+            12: "局部重绘(Alimama)",
+            13: "深度-出图质量更高但不能调节强度(FluxTools)",
+            14: "硬边线稿-出图质量更高但不能调节强度(FluxTools)",
+            15: "局部重绘(FluxTools)",
+            16: "深度-出图质量正常可以调节强度(FluxTools)",
+            17: "硬边线稿-出图质量正常可以调节强度(FluxTools)"
+        }, default=3, porttype='number', visibleCondition='obj["ref_control"] == 1 && !obj["model_input"]')),
+        ("ref_image", PImage(text="上传ContolNet参考图片", needHandle=True, optional=True, autorunRequired=True,
+                             visibleCondition='obj["ref_control"] == 1 && !obj["model_input"]')),
+        ("control_strength",
+         PFloat(text="控制强度", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                visibleCondition='obj["ref_control"] == 1 && obj["style_select"] not in [13,14,15] && !obj["model_input"]')),
+        ("guidance_start",
+         PFloat(text="引导介入时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0,
+                visibleCondition='obj["ref_control"] == 1 && obj["style_select"] not in [13,14,15,16,17] && !obj["model_input"]')),
+        ("guidance_end",
+         PFloat(text="引导终止时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01,
+                default=0.8,
+                visibleCondition='obj["ref_control"] == 1 && obj["style_select"] not in [13,14,15,16,17] && !obj["model_input"]')),
+        ("guidance", PFloat(text="提示词引导系数", needHandle=True, min=0, max=7, slider=True, sliderStep=0.1, step=0.1,
+                            default=3.5)),
+        ("sampler_steps",
+         PFloat(text="采样步数", needHandle=True, min=0, max=50, slider=True, sliderStep=1, step=1, default=20)),
+        ("sampler", PEnum(text="采样器", needHandle=True, staticEnum={
+            'euler': 'euler',
+            'ipndm': 'ipndm',
+            'uni_pc_bh2': 'uni_pc_bh2',
+            'dpmpp_2m': 'dpmpp_2m'
+        }, porttype='string', default="euler")),
+        ("scheduler", PEnum(text="调度器", needHandle=True, staticEnum={
+            'beta': 'beta',
+            'simple': 'simple',
+            'sgm_uniform': 'sgm_uniform'
+        }, porttype='string', default="beta")),
+        ("seed", PInt(text="随机种子", default=-1, min=-1, max=sys.maxsize, needHandle=True)),
+        ("image_amount",
+         PFloat(text="生成数量", needHandle=True, min=1, max=4, slider=True, sliderStep=1, step=1, default=1)),
+    ]
+    OUTPUTS = [
+        ("out_images", PObject(text="图片集合", needHandle=True, porttype='ImageSet', portkind='multi-large-image')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 拼接请求体
+        authinfo = getattr(context, "authinfo")
+        self.app_name = app_name = "flux"
+        self.sub_app_name = sub_app_name = self.flux_method
+
+        data = {
+            "params": {
+                "guidance": self.guidance,
+                "sampler_steps": self.sampler_steps,
+                "sampler": self.sampler,
+                "scheduler": self.scheduler,
+                "seed": self.seed,
+                "image_amount": self.image_amount,
+            }
+        }
+
+        # 获取模型输入，处理连接的模型数据
+        model_input = getattr(self, "model_input", None)
+
+        # 处理Lora参数 (优先使用连接的模型)
+        if model_input and isinstance(model_input, dict) and "loras" in model_input:
+            # 使用连接的模型中的loras参数
+            data["params"]["loras"] = model_input.get("loras", [])
+            logger.info(f"[AppFluxNodeNew] 使用连接的Lora模型，包含 {len(data['params']['loras'])} 个Lora")
+        else:
+            # 使用UI中的lora设置
+            loras = []
+            if hasattr(self, "lora_select") and self.lora_select != "None":
+                loras.append({"name": self.lora_select, "weight": self.lora_weight})
+            if hasattr(self, "lora_select_2") and self.lora_select_2 != "None":
+                loras.append({"name": self.lora_select_2, "weight": self.lora_weight_2})
+            if hasattr(self, "lora_select_3") and self.lora_select_3 != "None":
+                loras.append({"name": self.lora_select_3, "weight": self.lora_weight_3})
+            if loras:
+                data["params"]["loras"] = loras
+
+        # 处理ControlNet参数 (优先使用连接的模型)
+        if model_input and isinstance(model_input, dict):
+            # 如果有controlnets参数（来自FluxControlNetNode）
+            if "controlnets" in model_input:
+                data["params"]["controlnets"] = model_input["controlnets"]
+                logger.info(f"[AppFluxNodeNew] 使用连接的ControlNet模型，包含 {len(data['params']['controlnets'])} 个ControlNet")
+
+            # 如果有ref_control参数（特殊处理的ControlNet参数）
+            if "ref_control" in model_input and model_input["ref_control"]:
+                if isinstance(model_input["ref_control"], dict):
+                    # 如果是对象，表示是局部重绘等特殊ControlNet
+                    data["params"]["ref_control"] = model_input["ref_control"]
+                    # 特殊处理局部重绘模式
+                    if "style_select" in model_input["ref_control"] and model_input["ref_control"]["style_select"] == 15:
+                        data["params"]["guidance"] = 30
+                else:
+                    # 如果是数值，则设置为该数值（例如2表示"否"）
+                    data["params"]["ref_control"] = model_input["ref_control"]
+                logger.info(f"[AppFluxNodeNew] 使用连接的ref_control参数: {data['params'].get('ref_control')}")
+        elif hasattr(self, "ref_control") and self.ref_control == 1:
+            # 使用UI中的ControlNet设置
+            ref_control_payload = {
+                "style_select": self.style_select,
+                "ref_image": "https://dreammaker.fp.ps.netease.com/file/66cd365ebc8d632cfb449bdbDVFToSqA05",  # Default
+            }
+            if self.ref_image is not None:
+                ref_control_payload["ref_image"] = NparrayToBase64(self.ref_image)
+
+            # Conditional control_strength
+            if self.style_select not in [13, 14, 15]:
+                ref_control_payload["control_strength"] = self.control_strength
+            elif self.style_select in [16, 17]:  # 覆盖 control_strength 的默认值为 1
+                ref_control_payload["control_strength"] = 1
+
+            # Conditional guidance_start and guidance_end
+            if self.style_select not in [13, 14, 15, 16, 17]:
+                ref_control_payload["guidance_start"] = self.guidance_start
+                ref_control_payload["guidance_end"] = self.guidance_end
+
+            data["params"]["ref_control"] = ref_control_payload
+
+            # guidance overwrite for specific style_select
+            if self.style_select == 15:
+                data["params"]["guidance"] = 30
+
+        # 处理文生图、图生图、局部重绘的特定参数
+        if sub_app_name == "flux_t2i":
+            data["params"]["t2i_prompt"] = self.prompt
+            data["params"]["width"] = self.width
+            data["params"]["height"] = self.height
+        elif sub_app_name == "flux_i2i":
+            data["params"]["i2i_prompt"] = self.prompt
+            if self.input_image is not None:
+                data["params"]["input_image"] = NparrayToBase64(self.input_image)
+            data["params"]["denoise"] = self.denoise
+        elif sub_app_name == "flux_inpaint":
+            data["params"]["t2i_prompt"] = self.prompt  # JSON uses t2i_prompt for inpaint
+            input_image_payload = {}
+            if self.input_image is not None:
+                input_image_payload["originImg"] = NparrayToBase64(self.input_image)
+            if self.mask is not None:
+                input_image_payload["newImg"] = NparrayToBase64(self.mask)
+
+            if input_image_payload:  # only add if there's something to add
+                data["params"]["input_image"] = input_image_payload
+            data["params"]["denoise"] = self.denoise
+
+        output = comfy_i2i(app_name=app_name, sub_app_name=sub_app_name, payload=data, authinfo=authinfo, time_wait=600,
+                           blueprint_id=getattr(context, "blueprint_id"))
+        logger.info(f"[AppFluxNodeNew] app_name: {app_name}, sub_app_name: {sub_app_name}, output: {output}")
+        out_images = []
+        if output is not None:
+            for img in output.get("images", []):
+                out_images.append(download_image(img, authinfo=authinfo))
+        return {"out_images": out_images}@sunshineflow_node(PACKAGE_NAME)
+class FluxControlNetNode(ActionImageNodeBase):
+    NODE_TEXT = "Flux ControlNet控制"
+    NODE_ICON = "FaImage"
+    NODE_CATEGORY = "DreamMaker App"
+    DESCRIPTION = "为Flux模型提供多种ControlNet控制选项，支持多达3个ControlNet同时使用"
+
+    # 控制模式定义
+    FLUX_CONTROL_MODES = {
+        1: "硬边线稿-2.0 ✨",
+        2: "软边线稿-2.0 ✨",
+        3: "深度-2.0 ✨",
+        4: "Tile(分块放大)(Shakker)",
+        5: "姿势参考-2.0 ✨",
+        6: "深度(Shakker)",
+        7: "硬边线稿(Promeai)",
+        8: "硬边线稿(TheMistoAI)",
+        9: "深度(Jasperai)",
+        10: "模糊放大(Jasperai)",
+        11: "法线(Jasperai)",
+        12: "局部重绘(Alimama)",
+        13: "深度-出图质量更高但不能调节强度(FluxTools)",
+        14: "硬边线稿-出图质量更高但不能调节强度(FluxTools)",
+        15: "局部重绘(FluxTools)",
+        16: "深度-出图质量正常可以调节强度(FluxTools)",
+        17: "硬边线稿-出图质量正常可以调节强度(FluxTools)"
+    }
+
+    # 基础输入
+    INPUTS = [
+        ("model_input", PObject(text="模型输入", needHandle=True, optional=True, porttype='object',
+                              description="连接其他模型节点的输出，如FluxLoraNode")),
+        ("control_type", PEnum(text="控制类型", staticEnum={1: "多个ControlNet", 2: "单个特殊ControlNet（局部重绘等）"},
+                             default=1, needHandle=True, porttype='number')),
+
+        # 多个普通ControlNet的参数
+        # 第一个ControlNet
+        ("enabled_1", PEnum(text="启用普通ControlNet #1", staticEnum={True: '是', False: '否'}, default=True, needHandle=True, porttype='boolean',
+                           visibleCondition='obj["control_type"] == 1')),
+        ("image_1", PImage(text="参考图片 #1", needHandle=True, optional=True, autorunRequired=True,
+                         visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true')),
+        ("control_mode_1", PEnum(text="控制模式 #1", needHandle=True, staticEnum=FLUX_CONTROL_MODES,
+                                porttype='number', default=3, visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true')),
+        ("control_strength_1", PFloat(text="控制强度 #1", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                                  visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true && obj["control_mode_1"] not in [13,14,15]')),
+        ("guidance_start_1", PFloat(text="引导介入时机 #1", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0,
+                                 visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true && obj["control_mode_1"] not in [13,14,15,16,17]')),
+        ("guidance_end_1", PFloat(text="引导终止时机 #1", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.8,
+                               visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true && obj["control_mode_1"] not in [13,14,15,16,17]')),
+    ]
+
+    # 添加额外2个ControlNet选项
+    for i in range(2, 4):  # 创建 #2-#3 共2个额外ControlNet
+        INPUTS.extend([
+            (f"enabled_{i}", PEnum(text=f"启用普通ControlNet #{i}", staticEnum={True: '是', False: '否'}, default=False, needHandle=True, porttype='boolean',
+                                 visibleCondition='obj["control_type"] == 1')),
+            (f"image_{i}", PImage(text=f"参考图片 #{i}", needHandle=True, optional=True, autorunRequired=True,
+                                visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true')),
+            (f"control_mode_{i}", PEnum(text=f"控制模式 #{i}", needHandle=True, staticEnum=FLUX_CONTROL_MODES,
+                                      porttype='number', default=3, visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true')),
+            (f"control_strength_{i}", PFloat(text=f"控制强度 #{i}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                                        visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true && obj["control_mode_{i}"] not in [13,14,15]')),
+            (f"guidance_start_{i}", PFloat(text=f"引导介入时机 #{i}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0,
+                                       visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true && obj["control_mode_{i}"] not in [13,14,15,16,17]')),
+            (f"guidance_end_{i}", PFloat(text=f"引导终止时机 #{i}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.8,
+                                     visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true && obj["control_mode_{i}"] not in [13,14,15,16,17]')),
+        ])
+
+    # 特殊ControlNet参数
+    INPUTS.extend([
+        ("special_mode", PEnum(text="特殊控制模式", needHandle=True, staticEnum={
+            13: "深度-出图质量更高但不能调节强度(FluxTools)",
+            14: "硬边线稿-出图质量更高但不能调节强度(FluxTools)",
+            15: "局部重绘(FluxTools)",
+            16: "深度-出图质量正常可以调节强度(FluxTools)",
+            17: "硬边线稿-出图质量正常可以调节强度(FluxTools)"
+        }, default=15, porttype='number', visibleCondition='obj["control_type"] == 2')),
+        ("special_image", PImage(text="特殊控制参考图", needHandle=True, optional=True, autorunRequired=True,
+                               visibleCondition='obj["control_type"] == 2')),
+        ("special_strength", PFloat(text="特殊控制强度", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                                  visibleCondition='obj["control_type"] == 2 && obj["special_mode"] in [16,17]')),
+    ])
+
+    OUTPUTS = [
+        ("model", PObject(text="处理后的模型", needHandle=True, porttype='object')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 获取输入模型
+        model_input = getattr(self, "model_input", None)
+        control_type = getattr(self, "control_type", 1)
+
+        # 初始化输出模型
+        if isinstance(model_input, dict):
+            output_model = model_input.copy()
+        else:
+            output_model = {}
+
+        # 处理控制类型
+        if control_type == 1:  # 多个普通ControlNet
+            # 初始化controlnets数组
+            output_model["controlnets"] = output_model.get("controlnets", [])
+
+            # 处理所有ControlNet槽位
+            for i in range(1, 4):  # 处理3个可能的ControlNet
+                enabled = getattr(self, f"enabled_{i}", False)
+                image = getattr(self, f"image_{i}", None)
+
+                # 只在启用并有图像的情况下处理
+                if enabled and image is not None:
+                    control_mode = getattr(self, f"control_mode_{i}", 3)  # 默认深度-2.0
+                    control_strength = getattr(self, f"control_strength_{i}", 0.7)
+                    guidance_start = getattr(self, f"guidance_start_{i}", 0)
+                    guidance_end = getattr(self, f"guidance_end_{i}", 0.8)
+
+                    # 处理图像数据
+                    control_image_data = NparrayToBase64(image)
+
+                    # 创建ControlNet配置
+                    control_config = {
+                        "style_select": control_mode,
+                        "ref_image": control_image_data
+                    }
+
+                    # 根据不同控制模式添加特定参数
+                    if control_mode not in [13, 14, 15]:
+                        control_config["control_strength"] = control_strength
+
+                    # 对16和17特殊处理
+                    if control_mode in [16, 17]:
+                        control_config["control_strength"] = 1  # 强制设为1
+
+                    # 添加引导参数(排除特定模式)
+                    if control_mode not in [13, 14, 15, 16, 17]:
+                        control_config["guidance_start"] = guidance_start
+                        control_config["guidance_end"] = guidance_end
+
+                    # 添加到controlnets列表
+                    output_model["controlnets"].append(control_config)
+                    logger.info(f"[FluxControlNetNode] 已应用普通ControlNet #{i}: 模式={control_mode}, 强度={control_strength}")
+
+            # 如果没有任何有效的ControlNet，设置ref_control=2表示不使用
+            if not output_model["controlnets"]:
+                output_model["controlnets"] = []
+                output_model["ref_control"] = 2  # 2表示"否"
+
+        elif control_type == 2:  # 单个特殊ControlNet
+            special_mode = getattr(self, "special_mode", 15)
+            special_image = getattr(self, "special_image", None)
+
+            if special_image is not None:
+                # 创建特殊ControlNet配置
+                special_config = {
+                    "style_select": special_mode,
+                    "ref_image": NparrayToBase64(special_image)
+                }
+
+                # 对16和17特殊处理控制强度
+                if special_mode in [16, 17]:
+                    special_strength = getattr(self, "special_strength", 0.7)
+                    special_config["control_strength"] = special_strength
+
+                # 设置ref_control对象
+                output_model["ref_control"] = special_config
+
+                # 局部重绘模式需要特殊处理guidance值
+                if special_mode == 15:
+                    output_model["guidance"] = 30
+
+                logger.info(f"[FluxControlNetNode] 已应用特殊ControlNet: 模式={special_mode}")
+            else:
+                # 如果没有图像，则设置不使用ControlNet
+                output_model["ref_control"] = 2  # 2表示"否"
+
+        return {"model": output_model}
+
+
+@sunshineflow_node(PACKAGE_NAME)
+class MultiControlNetNode(ActionImageNodeBase):
+    NODE_TEXT = "多重ControlNet控制"
+    NODE_ICON = "FaImage"
+    NODE_CATEGORY = "模型"
+    DESCRIPTION = "使用多个ControlNet同时控制图像生成过程，可添加多达3个控制器"
+
+    # 控制模式定义
+    CONTROL_MODES = {
+        'canny': 'Canny边缘检测',
+        'depth': '深度图估计',
+        'openpose': '人体姿态',
+        'scribble': '线稿/素描',
+        'seg': '语义分割',
+        'normal': '法线图'
+    }
+
+    # 基础输入和第一个ControlNet（不带后缀）
+    INPUTS = [
+        ("model", PObject(text="基础模型", needHandle=True, porttype='object')),
+        ("enabled", PEnum(text="启用控制", staticEnum={True: '是', False: '否'}, default=True, needHandle=True, porttype='boolean')),
+        ("image", PImage(text="控制图像", needHandle=True, optional=True, autorunRequired=True,
+                       visibleCondition='obj["enabled"] == true')),
+        ("control_mode", PEnum(text="控制模式", needHandle=True, staticEnum=CONTROL_MODES,
+                              porttype='string', default="canny", visibleCondition='obj["enabled"] == true')),
+        ("weight", PFloat(text="控制强度", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                        visibleCondition='obj["enabled"] == true')),
+        ("guidance_start", PFloat(text="引导开始时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.0,
+                               visibleCondition='obj["enabled"] == true')),
+        ("guidance_end", PFloat(text="引导结束时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                             visibleCondition='obj["enabled"] == true')),
+    ]
+
+    # 添加额外2个ControlNet槽位（从1开始编号）
+    for i in range(1, 3):
+        INPUTS.extend([
+            (f"enabled_{i}", PEnum(text=f"启用控制 #{i+1}", staticEnum={True: '是', False: '否'}, default=False, needHandle=True, porttype='boolean')),
+            (f"image_{i}", PImage(text=f"控制图像 #{i+1}", needHandle=True, optional=True, autorunRequired=True,
+                                visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"control_mode_{i}", PEnum(text=f"控制模式 #{i+1}", needHandle=True, staticEnum=CONTROL_MODES,
+                                       porttype='string', default="canny", visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"weight_{i}", PFloat(text=f"控制强度 #{i+1}", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                                 visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"guidance_start_{i}", PFloat(text=f"引导开始时机 #{i+1}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.0,
+                                         visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"guidance_end_{i}", PFloat(text=f"引导结束时机 #{i+1}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                                       visibleCondition=f'obj["enabled_{i}"] == true')),
+        ])
+
+    OUTPUTS = [
+        ("model", PObject(text="处理后的模型", needHandle=True, porttype='object')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 获取输入模型
+        input_model = self.model
+
+        # 初始化输出模型
+        if isinstance(input_model, dict):
+            output_model = input_model.copy()
+            if "controlnet" not in output_model:
+                output_model["controlnet"] = []
+        else:
+            output_model = {
+                "base_model": input_model,
+                "controlnet": []
+            }
+
+        # 处理第一个ControlNet（不带后缀）
+        enabled = getattr(self, "enabled", False)
+        image = getattr(self, "image", None)
+
+        # 只有在启用并且有图像的情况下才应用
+        if enabled and image is not None:
+            control_mode = getattr(self, "control_mode", "canny")
+            weight = getattr(self, "weight", 1.0)
+            guidance_start = getattr(self, "guidance_start", 0.0)
+            guidance_end = getattr(self, "guidance_end", 1.0)
+
+            # 处理图像数据
+            control_image_data = NparrayToBase64(image) if callable(globals().get("NparrayToBase64")) else image
+
+            # 添加ControlNet配置
+            output_model["controlnet"].append({
+                "image": control_image_data,
+                "mode": control_mode,
+                "weight": weight,
+                "guidance_start": guidance_start,
+                "guidance_end": guidance_end
+            })
+
+            logger.info(f"[MultiControlNetNode] 已应用ControlNet: {control_mode}, 强度: {weight}")
+
+        # 处理额外的ControlNet槽位
+        for i in range(1, 3):
+            enabled = getattr(self, f"enabled_{i}", False)
+            image = getattr(self, f"image_{i}", None)
+
+            # 只有在启用并且有图像的情况下才应用
+            if enabled and image is not None:
+                control_mode = getattr(self, f"control_mode_{i}", "canny")
+                weight = getattr(self, f"weight_{i}", 1.0)
+                guidance_start = getattr(self, f"guidance_start_{i}", 0.0)
+                guidance_end = getattr(self, f"guidance_end_{i}", 1.0)
+
+                # 处理图像数据
+                control_image_data = NparrayToBase64(image) if callable(globals().get("NparrayToBase64")) else image
+
+                # 添加ControlNet配置
+                output_model["controlnet"].append({
+                    "image": control_image_data,
+                    "mode": control_mode,
+                    "weight": weight,
+                    "guidance_start": guidance_start,
+                    "guidance_end": guidance_end
+                })
+
+                logger.info(f"[MultiControlNetNode] 已应用ControlNet #{i+1}: {control_mode}, 强度: {weight}")
+
+        return {"model": output_model}@sunshineflow_node(PACKAGE_NAME)
+class FluxControlNetNode(ActionImageNodeBase):
+    NODE_TEXT = "Flux ControlNet控制"
+    NODE_ICON = "FaImage"
+    NODE_CATEGORY = "DreamMaker App"
+    DESCRIPTION = "为Flux模型提供多种ControlNet控制选项，支持多达3个ControlNet同时使用"
+
+    # 控制模式定义
+    FLUX_CONTROL_MODES = {
+        1: "硬边线稿-2.0 ✨",
+        2: "软边线稿-2.0 ✨",
+        3: "深度-2.0 ✨",
+        4: "Tile(分块放大)(Shakker)",
+        5: "姿势参考-2.0 ✨",
+        6: "深度(Shakker)",
+        7: "硬边线稿(Promeai)",
+        8: "硬边线稿(TheMistoAI)",
+        9: "深度(Jasperai)",
+        10: "模糊放大(Jasperai)",
+        11: "法线(Jasperai)",
+        12: "局部重绘(Alimama)",
+        13: "深度-出图质量更高但不能调节强度(FluxTools)",
+        14: "硬边线稿-出图质量更高但不能调节强度(FluxTools)",
+        15: "局部重绘(FluxTools)",
+        16: "深度-出图质量正常可以调节强度(FluxTools)",
+        17: "硬边线稿-出图质量正常可以调节强度(FluxTools)"
+    }
+
+    # 基础输入
+    INPUTS = [
+        ("model_input", PObject(text="模型输入", needHandle=True, optional=True, porttype='object',
+                              description="连接其他模型节点的输出，如FluxLoraNode")),
+        ("control_type", PEnum(text="控制类型", staticEnum={1: "多个ControlNet", 2: "单个特殊ControlNet（局部重绘等）"},
+                             default=1, needHandle=True, porttype='number')),
+
+        # 多个普通ControlNet的参数
+        # 第一个ControlNet
+        ("enabled_1", PEnum(text="启用普通ControlNet #1", staticEnum={True: '是', False: '否'}, default=True, needHandle=True, porttype='boolean',
+                           visibleCondition='obj["control_type"] == 1')),
+        ("image_1", PImage(text="参考图片 #1", needHandle=True, optional=True, autorunRequired=True,
+                         visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true')),
+        ("control_mode_1", PEnum(text="控制模式 #1", needHandle=True, staticEnum=FLUX_CONTROL_MODES,
+                                porttype='number', default=3, visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true')),
+        ("control_strength_1", PFloat(text="控制强度 #1", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                                  visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true && obj["control_mode_1"] not in [13,14,15]')),
+        ("guidance_start_1", PFloat(text="引导介入时机 #1", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0,
+                                 visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true && obj["control_mode_1"] not in [13,14,15,16,17]')),
+        ("guidance_end_1", PFloat(text="引导终止时机 #1", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.8,
+                               visibleCondition='obj["control_type"] == 1 && obj["enabled_1"] == true && obj["control_mode_1"] not in [13,14,15,16,17]')),
+    ]
+
+    # 添加额外2个ControlNet选项
+    for i in range(2, 4):  # 创建 #2-#3 共2个额外ControlNet
+        INPUTS.extend([
+            (f"enabled_{i}", PEnum(text=f"启用普通ControlNet #{i}", staticEnum={True: '是', False: '否'}, default=False, needHandle=True, porttype='boolean',
+                                 visibleCondition='obj["control_type"] == 1')),
+            (f"image_{i}", PImage(text=f"参考图片 #{i}", needHandle=True, optional=True, autorunRequired=True,
+                                visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true')),
+            (f"control_mode_{i}", PEnum(text=f"控制模式 #{i}", needHandle=True, staticEnum=FLUX_CONTROL_MODES,
+                                      porttype='number', default=3, visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true')),
+            (f"control_strength_{i}", PFloat(text=f"控制强度 #{i}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                                        visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true && obj["control_mode_{i}"] not in [13,14,15]')),
+            (f"guidance_start_{i}", PFloat(text=f"引导介入时机 #{i}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0,
+                                       visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true && obj["control_mode_{i}"] not in [13,14,15,16,17]')),
+            (f"guidance_end_{i}", PFloat(text=f"引导终止时机 #{i}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.8,
+                                     visibleCondition=f'obj["control_type"] == 1 && obj["enabled_{i}"] == true && obj["control_mode_{i}"] not in [13,14,15,16,17]')),
+        ])
+
+    # 特殊ControlNet参数
+    INPUTS.extend([
+        ("special_mode", PEnum(text="特殊控制模式", needHandle=True, staticEnum={
+            13: "深度-出图质量更高但不能调节强度(FluxTools)",
+            14: "硬边线稿-出图质量更高但不能调节强度(FluxTools)",
+            15: "局部重绘(FluxTools)",
+            16: "深度-出图质量正常可以调节强度(FluxTools)",
+            17: "硬边线稿-出图质量正常可以调节强度(FluxTools)"
+        }, default=15, porttype='number', visibleCondition='obj["control_type"] == 2')),
+        ("special_image", PImage(text="特殊控制参考图", needHandle=True, optional=True, autorunRequired=True,
+                               visibleCondition='obj["control_type"] == 2')),
+        ("special_strength", PFloat(text="特殊控制强度", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                                  visibleCondition='obj["control_type"] == 2 && obj["special_mode"] in [16,17]')),
+    ])
+
+    OUTPUTS = [
+        ("model", PObject(text="处理后的模型", needHandle=True, porttype='object')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 获取输入模型
+        model_input = getattr(self, "model_input", None)
+        control_type = getattr(self, "control_type", 1)
+
+        # 初始化输出模型
+        if isinstance(model_input, dict):
+            output_model = model_input.copy()
+        else:
+            output_model = {}
+
+        # 处理控制类型
+        if control_type == 1:  # 多个普通ControlNet
+            # 初始化controlnets数组
+            output_model["controlnets"] = output_model.get("controlnets", [])
+
+            # 处理所有ControlNet槽位
+            for i in range(1, 4):  # 处理3个可能的ControlNet
+                enabled = getattr(self, f"enabled_{i}", False)
+                image = getattr(self, f"image_{i}", None)
+
+                # 只在启用并有图像的情况下处理
+                if enabled and image is not None:
+                    control_mode = getattr(self, f"control_mode_{i}", 3)  # 默认深度-2.0
+                    control_strength = getattr(self, f"control_strength_{i}", 0.7)
+                    guidance_start = getattr(self, f"guidance_start_{i}", 0)
+                    guidance_end = getattr(self, f"guidance_end_{i}", 0.8)
+
+                    # 处理图像数据
+                    control_image_data = NparrayToBase64(image)
+
+                    # 创建ControlNet配置
+                    control_config = {
+                        "style_select": control_mode,
+                        "ref_image": control_image_data
+                    }
+
+                    # 根据不同控制模式添加特定参数
+                    if control_mode not in [13, 14, 15]:
+                        control_config["control_strength"] = control_strength
+
+                    # 对16和17特殊处理
+                    if control_mode in [16, 17]:
+                        control_config["control_strength"] = 1  # 强制设为1
+
+                    # 添加引导参数(排除特定模式)
+                    if control_mode not in [13, 14, 15, 16, 17]:
+                        control_config["guidance_start"] = guidance_start
+                        control_config["guidance_end"] = guidance_end
+
+                    # 添加到controlnets列表
+                    output_model["controlnets"].append(control_config)
+                    logger.info(f"[FluxControlNetNode] 已应用普通ControlNet #{i}: 模式={control_mode}, 强度={control_strength}")
+
+            # 如果没有任何有效的ControlNet，设置ref_control=2表示不使用
+            if not output_model["controlnets"]:
+                output_model["controlnets"] = []
+                output_model["ref_control"] = 2  # 2表示"否"
+
+        elif control_type == 2:  # 单个特殊ControlNet
+            special_mode = getattr(self, "special_mode", 15)
+            special_image = getattr(self, "special_image", None)
+
+            if special_image is not None:
+                # 创建特殊ControlNet配置
+                special_config = {
+                    "style_select": special_mode,
+                    "ref_image": NparrayToBase64(special_image)
+                }
+
+                # 对16和17特殊处理控制强度
+                if special_mode in [16, 17]:
+                    special_strength = getattr(self, "special_strength", 0.7)
+                    special_config["control_strength"] = special_strength
+
+                # 设置ref_control对象
+                output_model["ref_control"] = special_config
+
+                # 局部重绘模式需要特殊处理guidance值
+                if special_mode == 15:
+                    output_model["guidance"] = 30
+
+                logger.info(f"[FluxControlNetNode] 已应用特殊ControlNet: 模式={special_mode}")
+            else:
+                # 如果没有图像，则设置不使用ControlNet
+                output_model["ref_control"] = 2  # 2表示"否"
+
+        return {"model": output_model}
+
+
+@sunshineflow_node(PACKAGE_NAME)
+class MultiControlNetNode(ActionImageNodeBase):
+    NODE_TEXT = "多重ControlNet控制"
+    NODE_ICON = "FaImage"
+    NODE_CATEGORY = "模型"
+    DESCRIPTION = "使用多个ControlNet同时控制图像生成过程，可添加多达3个控制器"
+
+    # 控制模式定义
+    CONTROL_MODES = {
+        'canny': 'Canny边缘检测',
+        'depth': '深度图估计',
+        'openpose': '人体姿态',
+        'scribble': '线稿/素描',
+        'seg': '语义分割',
+        'normal': '法线图'
+    }
+
+    # 基础输入和第一个ControlNet（不带后缀）
+    INPUTS = [
+        ("model", PObject(text="基础模型", needHandle=True, porttype='object')),
+        ("enabled", PEnum(text="启用控制", staticEnum={True: '是', False: '否'}, default=True, needHandle=True, porttype='boolean')),
+        ("image", PImage(text="控制图像", needHandle=True, optional=True, autorunRequired=True,
+                       visibleCondition='obj["enabled"] == true')),
+        ("control_mode", PEnum(text="控制模式", needHandle=True, staticEnum=CONTROL_MODES,
+                              porttype='string', default="canny", visibleCondition='obj["enabled"] == true')),
+        ("weight", PFloat(text="控制强度", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                        visibleCondition='obj["enabled"] == true')),
+        ("guidance_start", PFloat(text="引导开始时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.0,
+                               visibleCondition='obj["enabled"] == true')),
+        ("guidance_end", PFloat(text="引导结束时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                             visibleCondition='obj["enabled"] == true')),
+    ]
+
+    # 添加额外2个ControlNet槽位（从1开始编号）
+    for i in range(1, 3):
+        INPUTS.extend([
+            (f"enabled_{i}", PEnum(text=f"启用控制 #{i+1}", staticEnum={True: '是', False: '否'}, default=False, needHandle=True, porttype='boolean')),
+            (f"image_{i}", PImage(text=f"控制图像 #{i+1}", needHandle=True, optional=True, autorunRequired=True,
+                                visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"control_mode_{i}", PEnum(text=f"控制模式 #{i+1}", needHandle=True, staticEnum=CONTROL_MODES,
+                                       porttype='string', default="canny", visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"weight_{i}", PFloat(text=f"控制强度 #{i+1}", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                                 visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"guidance_start_{i}", PFloat(text=f"引导开始时机 #{i+1}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.0,
+                                         visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"guidance_end_{i}", PFloat(text=f"引导结束时机 #{i+1}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                                       visibleCondition=f'obj["enabled_{i}"] == true')),
+        ])
+
+    OUTPUTS = [
+        ("model", PObject(text="处理后的模型", needHandle=True, porttype='object')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 获取输入模型
+        input_model = self.model
+
+        # 初始化输出模型
+        if isinstance(input_model, dict):
+            output_model = input_model.copy()
+            if "controlnet" not in output_model:
+                output_model["controlnet"] = []
+        else:
+            output_model = {
+                "base_model": input_model,
+                "controlnet": []
+            }
+
+        # 处理第一个ControlNet（不带后缀）
+        enabled = getattr(self, "enabled", False)
+        image = getattr(self, "image", None)
+
+        # 只有在启用并且有图像的情况下才应用
+        if enabled and image is not None:
+            control_mode = getattr(self, "control_mode", "canny")
+            weight = getattr(self, "weight", 1.0)
+            guidance_start = getattr(self, "guidance_start", 0.0)
+            guidance_end = getattr(self, "guidance_end", 1.0)
+
+            # 处理图像数据
+            control_image_data = NparrayToBase64(image) if callable(globals().get("NparrayToBase64")) else image
+
+            # 添加ControlNet配置
+            output_model["controlnet"].append({
+                "image": control_image_data,
+                "mode": control_mode,
+                "weight": weight,
+                "guidance_start": guidance_start,
+                "guidance_end": guidance_end
+            })
+
+            logger.info(f"[MultiControlNetNode] 已应用ControlNet: {control_mode}, 强度: {weight}")
+
+        # 处理额外的ControlNet槽位
+        for i in range(1, 3):
+            enabled = getattr(self, f"enabled_{i}", False)
+            image = getattr(self, f"image_{i}", None)
+
+            # 只有在启用并且有图像的情况下才应用
+            if enabled and image is not None:
+                control_mode = getattr(self, f"control_mode_{i}", "canny")
+                weight = getattr(self, f"weight_{i}", 1.0)
+                guidance_start = getattr(self, f"guidance_start_{i}", 0.0)
+                guidance_end = getattr(self, f"guidance_end_{i}", 1.0)
+
+                # 处理图像数据
+                control_image_data = NparrayToBase64(image) if callable(globals().get("NparrayToBase64")) else image
+
+                # 添加ControlNet配置
+                output_model["controlnet"].append({
+                    "image": control_image_data,
+                    "mode": control_mode,
+                    "weight": weight,
+                    "guidance_start": guidance_start,
+                    "guidance_end": guidance_end
+                })
+
+                logger.info(f"[MultiControlNetNode] 已应用ControlNet #{i+1}: {control_mode}, 强度: {weight}")
+
+        return {"model": output_model}    @apps_params_check
+    def Start(self, context):
+        # 获取输入模型
+        model_input = getattr(self, "model_input", None)
+
+        # 初始化输出模型
+        if isinstance(model_input, dict):
+            output_model = model_input.copy()
+            # 确保有loras键
+            if "loras" not in output_model:
+                output_model["loras"] = []
+        else:
+            output_model = {
+                "loras": []
+            }
+
+        # 处理所有Lora槽位
+        for i in range(1, 6):
+            lora_name = getattr(self, f"lora_select_{i}", None)
+            lora_weight = getattr(self, f"lora_weight_{i}", 1.0)
+
+            # 如果选择了有效的Lora
+            if lora_name and lora_name != "None":
+                # 检查是否已存在相同Lora
+                lora_exists = False
+                for lora in output_model["loras"]:
+                    if lora.get("name") == lora_name:
+                        lora["weight"] = lora_weight
+                        lora_exists = True
+                        break
+
+                # 如果不存在则添加新的
+                if not lora_exists:
+                    output_model["loras"].append({
+                        "name": lora_name,
+                        "weight": lora_weight
+                    })
+
+                logger.info(f"[FluxLoraNode] 已应用Lora #{i}: {lora_name}, 强度: {lora_weight}")
+
+        return {"model": output_model}# 基础输入
+    INPUTS = [
+        ("model_input", PObject(text="模型输入", needHandle=True, optional=True, porttype='object',
+                              description="连接其他模型节点的输出")),
+        ("lora_select_1", PEnum(text="选择Lora #1", needHandle=True, func=GetLoras, default="None", porttype='string')),
+        ("lora_weight_1", PFloat(text="Lora权重 #1", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                               visibleCondition='obj["lora_select_1"] != "None" && obj["lora_select_1"] != ""')),
+        ("lora_select_2", PEnum(text="选择Lora #2", needHandle=True, func=GetLoras, default="None", porttype='string')),
+        ("lora_weight_2", PFloat(text="Lora权重 #2", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                               visibleCondition='obj["lora_select_2"] != "None" && obj["lora_select_2"] != ""')),
+        ("lora_select_3", PEnum(text="选择Lora #3", needHandle=True, func=GetLoras, default="None", porttype='string')),
+        ("lora_weight_3", PFloat(text="Lora权重 #3", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                               visibleCondition='obj["lora_select_3"] != "None" && obj["lora_select_3"] != ""')),
+        ("lora_select_4", PEnum(text="选择Lora #4", needHandle=True, func=GetLoras, default="None", porttype='string')),
+        ("lora_weight_4", PFloat(text="Lora权重 #4", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                               visibleCondition='obj["lora_select_4"] != "None" && obj["lora_select_4"] != ""')),
+        ("lora_select_5", PEnum(text="选择Lora #5", needHandle=True, func=GetLoras, default="None", porttype='string')),
+        ("lora_weight_5", PFloat(text="Lora权重 #5", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                               visibleCondition='obj["lora_select_5"] != "None" && obj["lora_select_5"] != ""')),
+    ](ActionImageNodeBase):
+    NODE_TEXT = "Flux大模型（新版）"
+    NODE_ICON = "ImImages"
+    NODE_CATEGORY = "DreamMaker App"
+    KEEP_DIRTY = True
+    DESCRIPTION = "画面美学媲美MidjourneyV6，超强语义理解能力！使用更详细复杂的提示词效果更佳！另外，可使用局部重绘精确修改指定内容～（支持 Flux-tools 和多 Lora）"
+    INPUTS = [
+        ("flux_method", PEnum(text="出图方式", needHandle=False, staticEnum={
+            "flux_t2i": "文生图",
+            "flux_i2i": "图生图",
+            "flux_inpaint": "局部重绘",
+        }, default="flux_t2i")),
+        ("prompt", PStr(text="正向提示词",
+                        default='''模仿著名美剧《绝命毒师》电影的海报。海报上有一个表情严肃的面包师，围裙上撒满了面粉，手里拿着一根擀面杖，就像武器一样。他站在一家质朴的面包店中间，周围是一堆堆的面包、糕点和一袋袋面粉，所有这些都是为了模仿原版节目中标志性的沙漠背景而布置的。在他身后，面包店的黑板菜单上列出了"Flux"和"AI"等菜品，暗示着即将展开的烹饪混乱。面包师的表情很紧张，但又严肃得滑稽，好像他要用他的面团和决心来征服这个世界。标题"DreamMaker"以粗体字显示在顶部，"DreamMaker"是一种粗糙的、有裂纹的字体，金色的字母像刚烤好的面包。。海报的整体配色是温暖的面包房色调和让人想起原剧的粗粝的暗色调，融合了《绝命毒师》的激烈戏剧的轻松、烹饪风格。''',
+                        multiLine=True, needHandle=True)),
+        ("width",
+         PFloat(text="图片宽度", needHandle=True, min=64, max=2048, slider=True, sliderStep=64, step=64, default=1024,
+                visibleCondition='obj["flux_method"] == "flux_t2i"')),
+        ("height",
+         PFloat(text="图片高度", needHandle=True, min=64, max=2048, slider=True, sliderStep=64, step=64, default=1472,
+                visibleCondition='obj["flux_method"] == "flux_t2i"')),
+        ("input_image", PImage(text="上传原图", default=None, needHandle=True, optional=True, autorunRequired=True,
+                               visibleCondition='obj["flux_method"] in ["flux_i2i", "flux_inpaint"]')),
+        ("mask", PImage(text="蒙版", default=None, needHandle=True, optional=True, autorunRequired=True,
+                        visibleCondition='obj["flux_method"] == "flux_inpaint"')),
+        ("denoise",
+         PFloat(text="重绘幅度", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.75,
+                visibleCondition='obj["flux_method"] in ["flux_i2i", "flux_inpaint"]')),
+        ("lora_select", PEnum(text="选择Lora1", default="None", func=GetLoras, needHandle=True, porttype='string')),
+        ("lora_weight",
+         PFloat(text="Lora1权重", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1)),
+        ("lora_select_2", PEnum(text="选择Lora2", default="None", func=GetLoras, needHandle=True, porttype='string')),
+        ("lora_weight_2",
+         PFloat(text="Lora2权重", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1)),
+        ("lora_select_3", PEnum(text="选择Lora3", default="None", func=GetLoras, needHandle=True, porttype='string')),
+        ("lora_weight_3",
+         PFloat(text="Lora3权重", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1)),
+        ("ref_control",
+         PEnum(text="是否需要参考与控制（ControlNet）", staticEnum={1: '是', 2: '否'}, default=2, needHandle=False,
+               porttype='number')),
+        ("style_select", PEnum(text="参考和控制（ContolNet）", needHandle=True, staticEnum={
+            1: "硬边线稿-2.0 ✨",
+            2: "软边线稿-2.0 ✨",
+            3: "深度-2.0 ✨",
+            4: "Tile(分块放大)(Shakker)",
+            5: "姿势参考-2.0 ✨",
+            6: "深度(Shakker)",
+            7: "硬边线稿(Promeai)",
+            8: "硬边线稿(TheMistoAI)",
+            9: "深度(Jasperai)",
+            10: "模糊放大(Jasperai)",
+            11: "法线(Jasperai)",
+            12: "局部重绘(Alimama)",
+            13: "深度-出图质量更高但不能调节强度(FluxTools)",
+            14: "硬边线稿-出图质量更高但不能调节强度(FluxTools)",
+            15: "局部重绘(FluxTools)",
+            16: "深度-出图质量正常可以调节强度(FluxTools)",
+            17: "硬边线稿-出图质量正常可以调节强度(FluxTools)"
+        }, default=3, porttype='number', visibleCondition='obj["ref_control"] == 1')),
+        ("ref_image", PImage(text="上传ContolNet参考图片", needHandle=True, optional=True, autorunRequired=True,
+                             visibleCondition='obj["ref_control"] == 1')),
+        ("control_strength",
+         PFloat(text="控制强度", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.7,
+                visibleCondition='obj["ref_control"] == 1 and obj["style_select"] not in [13,14,15]')),
+        ("guidance_start",
+         PFloat(text="引导介入时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0,
+                visibleCondition='obj["ref_control"] == 1 and obj["style_select"] not in [13,14,15,16,17]')),
+        ("guidance_end",
+         PFloat(text="引导终止时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01,
+                default=0.8,
+                visibleCondition='obj["ref_control"] == 1 and obj["style_select"] not in [13,14,15,16,17]')),
+        ("guidance", PFloat(text="提示词引导系数", needHandle=True, min=0, max=7, slider=True, sliderStep=0.1, step=0.1,
+                            default=3.5)),
+        ("sampler_steps",
+         PFloat(text="采样步数", needHandle=True, min=0, max=50, slider=True, sliderStep=1, step=1, default=20)),
+        ("sampler", PEnum(text="采样器", needHandle=True, staticEnum={
+            'euler': 'euler',
+            'ipndm': 'ipndm',
+            'uni_pc_bh2': 'uni_pc_bh2',
+            'dpmpp_2m': 'dpmpp_2m'
+        }, porttype='string', default="euler")),
+        ("scheduler", PEnum(text="调度器", needHandle=True, staticEnum={
+            'beta': 'beta',
+            'simple': 'simple',
+            'sgm_uniform': 'sgm_uniform'
+        }, porttype='string', default="beta")),
+        ("seed", PInt(text="随机种子", default=-1, min=-1, max=sys.maxsize, needHandle=True)),
+        ("image_amount",
+         PFloat(text="生成数量", needHandle=True, min=1, max=4, slider=True, sliderStep=1, step=1, default=1)),
+    ]
+    OUTPUTS = [
+        ("out_images", PObject(text="图片集合", needHandle=True, porttype='ImageSet', portkind='multi-large-image')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 拼接请求体
+        authinfo = getattr(context, "authinfo")
+        self.app_name = app_name = "flux"
+        self.sub_app_name = sub_app_name = self.flux_method
+
+        data = {
+            "params": {
+                "guidance": self.guidance,
+                "sampler_steps": self.sampler_steps,
+                "sampler": self.sampler,
+                "scheduler": self.scheduler,
+                "seed": self.seed,
+                "image_amount": self.image_amount,
+            }
+        }
+
+        # 处理Lora参数
+        loras = []
+        if self.lora_select != "None":
+            loras.append({"name": self.lora_select, "weight": self.lora_weight})
+        if self.lora_select_2 != "None":
+            loras.append({"name": self.lora_select_2, "weight": self.lora_weight_2})
+        if self.lora_select_3 != "None":
+            loras.append({"name": self.lora_select_3, "weight": self.lora_weight_3})
+        if loras:
+            data["params"]["loras"] = loras
+
+        # 处理ControlNet参数
+        if self.ref_control == 1:
+            ref_control_payload = {
+                "style_select": self.style_select,
+                "ref_image": "https://dreammaker.fp.ps.netease.com/file/66cd365ebc8d632cfb449bdbDVFToSqA05",  # Default
+            }
+            if self.ref_image is not None:
+                ref_control_payload["ref_image"] = NparrayToBase64(self.ref_image)
+
+            # Conditional control_strength
+            if self.style_select not in [13, 14, 15]:
+                ref_control_payload["control_strength"] = self.control_strength
+            elif self.style_select in [16, 17]:  # 覆盖 control_strength 的默认值为 1
+                ref_control_payload["control_strength"] = 1
+
+            # Conditional guidance_start and guidance_end
+            if self.style_select not in [13, 14, 15, 16, 17]:
+                ref_control_payload["guidance_start"] = self.guidance_start
+                ref_control_payload["guidance_end"] = self.guidance_end
+
+            data["params"]["ref_control"] = ref_control_payload
+
+            # guidance overwrite for specific style_select
+            if self.style_select == 15:
+                data["params"]["guidance"] = 30
+
+        if sub_app_name == "flux_t2i":
+            data["params"]["t2i_prompt"] = self.prompt
+            data["params"]["width"] = self.width
+            data["params"]["height"] = self.height
+        elif sub_app_name == "flux_i2i":
+            data["params"]["i2i_prompt"] = self.prompt
+            if self.input_image is not None:
+                data["params"]["input_image"] = NparrayToBase64(self.input_image)
+            # Consider adding an else to raise an error if input_image is essential and None
+            data["params"]["denoise"] = self.denoise
+        elif sub_app_name == "flux_inpaint":
+            data["params"]["t2i_prompt"] = self.prompt  # JSON uses t2i_prompt for inpaint
+            input_image_payload = {}
+            if self.input_image is not None:
+                input_image_payload["originImg"] = NparrayToBase64(self.input_image)
+            if self.mask is not None:
+                input_image_payload["newImg"] = NparrayToBase64(self.mask)
+
+            if input_image_payload:  # only add if there's something to add
+                data["params"]["input_image"] = input_image_payload
+            # Consider adding an else to raise an error if input_image/mask is essential and None
+            data["params"]["denoise"] = self.denoise
+
+        output = comfy_i2i(app_name=app_name, sub_app_name=sub_app_name, payload=data, authinfo=authinfo, time_wait=600,
+                           blueprint_id=getattr(context, "blueprint_id"))
+        logger.info(f"[AppFluxNodeNew] app_name: {app_name}, sub_app_name: {sub_app_name}, output: {output}")
+        out_images = []
+        if output is not None:
+            for img in output.get("images", []):  # Add default empty list for .get()
+                out_images.append(download_image(img, authinfo=authinfo))
+        return {"out_images": out_images}
+
+
+@sunshineflow_node(PACKAGE_NAME)
+class FluxModelNode(ActionImageNodeBase):
+    NODE_TEXT = "Flux加载模型"
+    NODE_ICON = "FaPuzzlePiece"
+    NODE_CATEGORY = "模型"
+    DESCRIPTION = "将多个Lora模型应用于基础模型，可同时使用多达4个Lora"
+
+    # 基础输入
+    INPUTS = [
+        ("lora_select", PEnum(text="Lora模型", needHandle=True, optional=False, func=GetLoras, default="None", porttype='string')),
+        ("lora_weight", PFloat(text="Lora强度", needHandle=True, optional=False, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                              visibleCondition='obj["lora_select"] != "None" and obj["lora_select"] != ""')),
+    ]
+
+    # 添加额外2个Lora槽位（从1开始编号）
+    for i in range(1, 2):
+        INPUTS.extend([
+            (f"lora_select_{i}", PEnum(text=f"Lora模型 #{i+1}", needHandle=True, optional=True, func=GetLoras, default="None", porttype='string')),
+            (f"lora_weight_{i}", PFloat(text=f"Lora强度 #{i+1}", needHandle=True, optional=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                                       visibleCondition=f'obj["lora_select_{i}"] != "None" and obj["lora_select_{i}"] != ""')),
+        ])
+
+    OUTPUTS = [
+        ("model", PObject(text="处理后的模型", needHandle=True, porttype='object')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 获取输入模型
+        input_model = self.model
+
+        # 初始化输出模型
+        if isinstance(input_model, dict):
+            output_model = input_model.copy()
+            if "loras" not in output_model:
+                output_model["loras"] = []
+        else:
+            output_model = {
+                "base_model": input_model,
+                "loras": []
+            }
+
+        # 处理第一个Lora（不带后缀）
+        lora_name = getattr(self, "lora_select", None)
+        lora_weight = getattr(self, "lora_weight", 1.0)
+
+        if lora_name and lora_name != "None":
+            # 检查是否已存在相同Lora
+            lora_exists = False
+            for lora in output_model["loras"]:
+                if lora.get("name") == lora_name:
+                    lora["strength"] = lora_weight
+                    lora_exists = True
+                    break
+
+            # 如果不存在则添加新的
+            if not lora_exists:
+                output_model["loras"].append({
+                    "name": lora_name,
+                    "strength": lora_weight
+                })
+
+            logger.info(f"[MultiLoraNode] 已应用Lora: {lora_name}, 强度: {lora_weight}")
+
+        # 处理额外的Lora槽位
+        for i in range(1, 4):
+            lora_name = getattr(self, f"lora_select_{i}", None)
+            lora_weight = getattr(self, f"lora_weight_{i}", 1.0)
+
+            # 如果选择了有效的Lora
+            if lora_name and lora_name != "None":
+                # 检查是否已存在相同Lora
+                lora_exists = False
+                for lora in output_model["loras"]:
+                    if lora.get("name") == lora_name:
+                        lora["strength"] = lora_weight
+                        lora_exists = True
+                        break
+
+                # 如果不存在则添加新的
+                if not lora_exists:
+                    output_model["loras"].append({
+                        "name": lora_name,
+                        "strength": lora_weight
+                    })
+
+                logger.info(f"[MultiLoraNode] 已应用Lora #{i+1}: {lora_name}, 强度: {lora_weight}")
+
+        return {"model": output_model}
+
+
+@sunshineflow_node(PACKAGE_NAME)
+class MultiControlNetNode(ActionImageNodeBase):
+    NODE_TEXT = "多重ControlNet控制"
+    NODE_ICON = "FaImage"
+    NODE_CATEGORY = "模型"
+    DESCRIPTION = "使用多个ControlNet同时控制图像生成过程，可添加多达3个控制器"
+
+    # 控制模式定义
+    CONTROL_MODES = {
+        'canny': 'Canny边缘检测',
+        'depth': '深度图估计',
+        'openpose': '人体姿态',
+        'scribble': '线稿/素描',
+        'seg': '语义分割',
+        'normal': '法线图'
+    }
+
+    # 基础输入和第一个ControlNet（不带后缀）
+    INPUTS = [
+        ("model", PObject(text="基础模型", needHandle=True, porttype='object')),
+        ("enabled", PEnum(text="启用控制", staticEnum={True: '是', False: '否'}, default=True, needHandle=True, porttype='boolean')),
+        ("image", PImage(text="控制图像", needHandle=True, optional=True, autorunRequired=True,
+                       visibleCondition='obj["enabled"] == true')),
+        ("control_mode", PEnum(text="控制模式", needHandle=True, staticEnum=CONTROL_MODES,
+                              porttype='string', default="canny", visibleCondition='obj["enabled"] == true')),
+        ("weight", PFloat(text="控制强度", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                        visibleCondition='obj["enabled"] == true')),
+        ("guidance_start", PFloat(text="引导开始时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.0,
+                               visibleCondition='obj["enabled"] == true')),
+        ("guidance_end", PFloat(text="引导结束时机", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                             visibleCondition='obj["enabled"] == true')),
+    ]
+
+    # 添加额外2个ControlNet槽位（从1开始编号）
+    for i in range(1, 3):
+        INPUTS.extend([
+            (f"enabled_{i}", PEnum(text=f"启用控制 #{i+1}", staticEnum={True: '是', False: '否'}, default=False, needHandle=True, porttype='boolean')),
+            (f"image_{i}", PImage(text=f"控制图像 #{i+1}", needHandle=True, optional=True, autorunRequired=True,
+                                visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"control_mode_{i}", PEnum(text=f"控制模式 #{i+1}", needHandle=True, staticEnum=CONTROL_MODES,
+                                       porttype='string', default="canny", visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"weight_{i}", PFloat(text=f"控制强度 #{i+1}", needHandle=True, min=0, max=2, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                                 visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"guidance_start_{i}", PFloat(text=f"引导开始时机 #{i+1}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=0.0,
+                                         visibleCondition=f'obj["enabled_{i}"] == true')),
+            (f"guidance_end_{i}", PFloat(text=f"引导结束时机 #{i+1}", needHandle=True, min=0, max=1, slider=True, sliderStep=0.01, step=0.01, default=1.0,
+                                       visibleCondition=f'obj["enabled_{i}"] == true')),
+        ])
+
+    OUTPUTS = [
+        ("model", PObject(text="处理后的模型", needHandle=True, porttype='object')),
+    ]
+
+    @apps_params_check
+    def Start(self, context):
+        # 获取输入模型
+        input_model = self.model
+
+        # 初始化输出模型
+        if isinstance(input_model, dict):
+            output_model = input_model.copy()
+            if "controlnet" not in output_model:
+                output_model["controlnet"] = []
+        else:
+            output_model = {
+                "base_model": input_model,
+                "controlnet": []
+            }
+
+        # 处理第一个ControlNet（不带后缀）
+        enabled = getattr(self, "enabled", False)
+        image = getattr(self, "image", None)
+
+        # 只有在启用并且有图像的情况下才应用
+        if enabled and image is not None:
+            control_mode = getattr(self, "control_mode", "canny")
+            weight = getattr(self, "weight", 1.0)
+            guidance_start = getattr(self, "guidance_start", 0.0)
+            guidance_end = getattr(self, "guidance_end", 1.0)
+
+            # 处理图像数据
+            control_image_data = NparrayToBase64(image) if callable(globals().get("NparrayToBase64")) else image
+
+            # 添加ControlNet配置
+            output_model["controlnet"].append({
+                "image": control_image_data,
+                "mode": control_mode,
+                "weight": weight,
+                "guidance_start": guidance_start,
+                "guidance_end": guidance_end
+            })
+
+            logger.info(f"[MultiControlNetNode] 已应用ControlNet: {control_mode}, 强度: {weight}")
+
+        # 处理额外的ControlNet槽位
+        for i in range(1, 3):
+            enabled = getattr(self, f"enabled_{i}", False)
+            image = getattr(self, f"image_{i}", None)
+
+            # 只有在启用并且有图像的情况下才应用
+            if enabled and image is not None:
+                control_mode = getattr(self, f"control_mode_{i}", "canny")
+                weight = getattr(self, f"weight_{i}", 1.0)
+                guidance_start = getattr(self, f"guidance_start_{i}", 0.0)
+                guidance_end = getattr(self, f"guidance_end_{i}", 1.0)
+
+                # 处理图像数据
+                control_image_data = NparrayToBase64(image) if callable(globals().get("NparrayToBase64")) else image
+
+                # 添加ControlNet配置
+                output_model["controlnet"].append({
+                    "image": control_image_data,
+                    "mode": control_mode,
+                    "weight": weight,
+                    "guidance_start": guidance_start,
+                    "guidance_end": guidance_end
+                })
+
+                logger.info(f"[MultiControlNetNode] 已应用ControlNet #{i+1}: {control_mode}, 强度: {weight}")
+
+        return {"model": output_model}
+
