@@ -1,0 +1,865 @@
+# -*- coding: utf-8 -*-
+from custom.client.visual.comp.OutlineAndMaskMgr import DEFAULT_OUTLINE_MASK_COLOR
+from custom.pub.utils import color_to_rgb
+from ..VProxyMetaInfo import VProxyCompDecorator
+from VDisplayComp import VDisplayComp
+from custom.client.cache.ModelSfxCache import ModelSfxCache
+from custom.client.cache.ModelUtils import set_shadow_fading_base_obj, visual_unit_bind_model_and_phy_body, set_model_material_var, get_model_material_var
+import Globals
+from custom.client import UIData
+import math3d
+from custom.client.Utils import change_camp_color, enable_mask_and_outline, get_main_scene, enable_render_after_see_through, enable_outline, set_outline_value, set_outline_mask_color, enable_mask, \
+	set_fresnel_value_egg, reset_fresnel_value_egg, get_model_config, get_model_skin_by_skin_id, set_simple_outline_value
+from custom.client.client_consts import SEE_THROUGH_COLOR, DEFAULT_RENDER_THROUGH_COLOR, SHP_COLOR_DARK, SHP_FRESNEL_STRENGTH, SHP_NORMAL_INTENSITY
+from custom.pub.consts import BattleRuleType, MapDataVersionType
+from custom.client.client_consts import ModelGroup, SHP_RimColor, SHP_FRESNEL_SCALE
+from custom.client.client_const_modules.const_materials import SHP_INTENSITY
+from custom.client.cmodule import VisualMgr
+from custom.client.client_consts import ModelFlag
+from data.common import modifier_model_data
+from custom.client.cache.CharLoader import CharLoader
+from custom.client.Utils import get_model_path
+from custom.pub.consts import CreatureType
+import render
+from custom.client.client_utils_modules.util_model import get_all_merge_model, set_model_mtg_by_target, set_model_mtg_by_sub_mats
+# from custom.client.client_const_modules.client_res_const.const_gim import BASE_CREATURE_MODEL_PATH
+
+
+class VCreatureDisplayComp(VDisplayComp):
+	# 角色表现
+	__vmsg__ = VProxyCompDecorator(VDisplayComp)
+
+	def __init_component__(self, _):
+		VDisplayComp.__init_component__.__func__(self, _)
+		self.ctx_is_npc = False  # 是否是 npc
+		self.ctx_is_creature = False # 是否是生物
+		self.ctx_camp_id = 0  # 阵营染色
+		self.ctx_model_id = 0  # 变化成模型表中的模型ID
+		self.ctx_anim_res_map_path = ''  # 替换动画资源
+
+		self.char_loader = None
+		self.is_lazy_loading = True
+
+		self.change_model_id = 0
+		self.change_anim_res_map_path = ''
+
+		self.accessory_item_mgr = None
+		self.is_binded_model_change_material = False  # 绑定的模型是否改变过材质
+		self._ori_material_value = None
+		self._fresnel_rendercb_index = None
+		self._fresnel_update_properties = None
+		self._cur_float_fresnel_intensity = None
+		self.init_model_path = ''
+
+	def __create_component__(self, content):
+		VDisplayComp.__create_component__.__func__(self, content)
+		self.npc_kill_icon_path = content.get('npc_kill_icon_path', "")
+		self.close_creature_far_cull = content.get('close_creature_far_cull', False)
+		self.enable_aim_outline = content.get('enable_aim_outline', True)
+		self.is_ugc_face = content.get('is_ugc_face', False)
+
+	def __post_component__(self, _):
+		lunit = self._lunit
+		if lunit and lunit.is_creature():
+			self.ctx_is_creature = True
+		else:
+			self.ctx_is_creature = False
+		VDisplayComp.__post_component__.__func__(self, _)
+
+		is_in_farm = bool(Globals.c_hero and Globals.c_hero.is_in_farm())
+		if is_in_farm:
+			unit_eid = getattr(lunit, 'unit_eid', 0)
+			from custom.client.client_utils_modules.util_model import imp_farm_unit_special_lod_info
+			imp_farm_unit_special_lod_info(self, unit_eid)
+
+	def __fini_component__(self):
+		self.render_see_through(False)
+		self.stop_fresnel_gradual_change()
+		VDisplayComp.__fini_component__.__func__(self)
+		self._clean_char_loader()
+
+	def _setup_model_material_value(self, content):
+		VDisplayComp._setup_model_material_value.__func__(self, content)
+		model_id = content.get('model', 0)
+		sel_skin = content.get('sel_skin', 0)
+		model_config = get_model_config(model_id)
+		if model_config:
+			_, skin = get_model_skin_by_skin_id(model_id, sel_skin, model_config)
+			self.mat_path = skin.get('MaterialPath', '')
+			self.intensity_r = None
+
+			self.intensity_g = skin.get('intensity_g', None) if getattr(self, 'intensity_g', None) is None else self.intensity_g
+			self.intensity_b = skin.get('intensity_b', None) if getattr(self, 'intensity_b', None) is None else self.intensity_b
+			self.intensity_a = skin.get('intensity_a', None) if getattr(self, 'intensity_a', None) is None else self.intensity_a
+			self.intensity_r = skin.get('intensity_r', None)
+			self.intensity_g_channel = skin.get('intensity_g_channel', None)
+			self.intensity_b_channel = skin.get('intensity_b_channel', None)
+
+	def _parse_model_info(self, content, model_conf=None):
+		self.parse_fashion_info(content)
+		self.ctx_need_add_to_group = False
+
+	def _record_ori_material_value(self):
+		if self._ori_material_value:
+			return
+		self._ori_material_value = self.get_cur_material_value()
+
+	def get_cur_material_value(self):
+		from custom.client.client_consts import Skin_Material_Attr
+		from custom.client.client_consts import INTENSITY_ATTR_LIST
+		ret = {}
+		for attr in Skin_Material_Attr:
+			if attr == 'gradient':
+				ret['gradient_axis'] = getattr(self, 'gradient_axis', None)
+				ret['gradient_center'] = getattr(self, 'gradient_center', None)
+				ret['gradient_contrast'] = getattr(self, 'gradient_contrast', None)
+			elif attr == 'intensity':
+				for key in INTENSITY_ATTR_LIST:
+					ret[key] = getattr(self, key, None)
+			elif attr == 'emissive_intensity':
+				for key in ('emissive_intensity_1', 'emissive_intensity_2', 'emissive_intensity_3', 'emissive_intensity_4'):
+					ret[key] = getattr(self, key, None)
+			else:
+				ret[attr] = getattr(self, attr, None)
+		ret.update({
+			'intensity_r': getattr(self, 'intensity_r', None),
+			'intensity_g': getattr(self, 'intensity_g', None),
+			'intensity_b': getattr(self, 'intensity_b', None),
+			'intensity_a': getattr(self, 'intensity_a', None),
+			'intensity_g_channel': getattr(self, 'intensity_g_channel', None),
+			'intensity_b_channel': getattr(self, 'intensity_b_channel', None)
+		})
+		return ret
+
+	def set_cur_material_value(self, content):
+		if not content:
+			return
+		for key, value in content.iteritems():
+			setattr(self, key, value)
+
+	def parse_fashion_info(self, info):
+		self.ctx_model_path = info.get('Path', self.ctx_model_path)
+		self.ctx_model_id = info.get('model', self.ctx_model_id) if self.creature_type == CreatureType.MODEL else 0
+		if self.ctx_model_id:
+			self.ctx_model_path = get_model_path(self.ctx_model_id)
+		self.ctx_is_npc = info.get('is_npc', self.ctx_is_npc)
+		self.ctx_anim_res_map_path = info.get('anim_res_map_path', '')
+		if not self.ctx_anim_res_map_path:
+			model = Globals.game_data_mgr.get('editor_model', self.ctx_model_id)
+			if model:
+				self.ctx_anim_res_map_path = model.get('anim_res_map_path', self.ctx_anim_res_map_path)
+
+	def _clean_char_loader(self):
+		if self.char_loader:
+			self.char_loader.destroy()
+			self.char_loader = None
+
+	def _create_char_loader(self, is_async):
+		if self.char_loader:
+			self.char_loader.destroy()
+		c = CharLoader(is_async)
+		if is_async and self._visual_unit and self._visual_unit.focused:
+			c.set_priority_as_hero(True)
+		# if is_async and self.ctx_is_creature:
+		# 	c.set_basic_params(replace_model_path=BASE_CREATURE_MODEL_PATH)
+		self.char_loader = c
+
+	def create_model(self):
+		is_async = Globals.c_hero and Globals.c_hero.is_in_hall()
+		self.is_lazy_loading = is_async
+		self._create_model_init(is_async)
+
+		# 1. 创建模型
+		# 2. 返回设置模型
+		# self._model_load_finish()
+		self._model_load_finish
+		self._change_model_load_finish
+
+	# 分析三种创建模型的途径
+	# 1.变成特殊模型——炸弹崽之类的模型。
+	# 2.生成NPC——依赖NPC的 model_path 与 ctx_anim_graph_url
+	# 3.正常生成人物模型。
+	# 分析模型调用流程
+	# 1.生成(NPC、人物模型）。
+	# 2.切换(NPC、人物模型) --> 特异模型
+	# 3.恢复(特异模型) --> NPC、人物模型
+	# 特质
+	# 1.调用流程3中，依赖旧数据：NPC(self.ctx_anim_graph_url、self.ctx_model_path)，人物模型(人物模型数据存储)
+	# 2.调用流程1中，初始化时，依赖数据：同特质1。
+	# 3.调用流程2与3中，self.ctx_model_path作为了变形术，或者炸弹崽的的传递参数，而恢复时，对ctx_model_path不再做使用。
+	# 考虑代码迭代方向
+	# 1.使1和3完全一致，采取分发方式处理NPC与人物。
+	# 2.使2透明，不修改数据格式。
+	# 其他
+	# 1.ctx_model_path被用作日志打印。
+
+	def _create_model_init(self, is_async):
+		# 可异步
+		self._create_model_by_inherit(is_async, self._model_load_finish, self._change_model_load_finish)
+
+	def _create_model_reset(self, finish_cb_decorated=None):
+		if finish_cb_decorated:
+			self._create_model_by_inherit(True, finish_cb=finish_cb_decorated)
+		else:
+			self._create_model_by_inherit(True, finish_cb=self._change_model_load_finish)
+
+	def _create_model_by_inherit(self, is_async=True, finish_cb=None, change_model_load_finish=None):
+		self._create_char_loader(is_async=is_async)
+		self._create_specified_model_or_npc(self.ctx_model_path, self.ctx_anim_graph_url, self.ctx_anim_res_map_path, finish_cb, change_model_load_finish)
+
+	def _create_model_by_specify(self, model_path, graph_path, anim_res_map_path='', is_async=True, finish_cb=None, change_model_load_finish=None, need_graph=False):
+		self._create_char_loader(is_async=is_async)
+		self._create_specified_model_or_npc(model_path, graph_path, anim_res_map_path, finish_cb, change_model_load_finish, need_graph=need_graph)
+
+	def _create_specified_model_or_npc(self, model_path, graph_path, anim_res_map_path, finish_cb, change_model_load_finish, need_graph=False):
+		from custom.client.helper.model_data_helper.ModelResCheck import check_res_path_exist
+		print 'check model_path: ', model_path
+		if not check_res_path_exist(model_path) or not self._check_sub_skin_low_on_require_ready_with_model_path(model_path):
+			model_path = ModelSfxCache.BASE_MODEL_PATH
+		self.char_loader.gen_npc(graph_path, anim_res_map_path, model_path, finish_cb, change_model_load_finish, need_graph)
+
+	def _check_sub_skin_low_on_require_ready_with_model_path(self, model_path):
+		# # sub_skin_low_download_on_required-temp-用模型直接加载-不触发下载，仅进行校验
+		from custom.client.helper.model_data_helper.SubSkinLowModelPrecheckMgr import SubSkinLowModelPrecheckMgr
+		if SubSkinLowModelPrecheckMgr.instance().check_fashion_full_res_with_model_path(model_path):
+			return True
+		else:
+			return False
+
+	def _need_high_quality_rule(self):
+		return self.blackbox and self.blackbox.battle_rule_mgr and self.blackbox.battle_rule_mgr.rule_type in [BattleRuleType.NEWBIE, BattleRuleType.WHO_IS_SPY]
+
+	def _do_model_load_error(self):
+		print 'no model, now fashion_id(or modifier model id): ', self.ctx_fashion_id
+		print 'no model, npc_model_path: ', self.ctx_model_path
+		from custom.client import client_consts
+		if not client_consts.IS_PUBLISH_VERSION:
+			import Globals
+			Globals.traceback.show('no model, now fashion_id(or modifier model id){0}, npc_model_path:{1}'.format(self.ctx_fashion_id, self.ctx_model_path))
+
+	def _model_load_finish(self, model, anim_graph, graph_inited=False, is_lazy_load=False):
+
+		if not model or not model.valid:
+			self._do_model_load_error()
+			return
+
+		scene = get_main_scene()
+
+		self._setup_model(model, scene, 0x04, is_lazy_load)
+		self.init_anim(anim_graph=anim_graph, graph_inited=graph_inited)
+		is_lazy_load and self.init_spring_anim_rag_doll()
+
+	def _setup_model(self, model, scene, scene_flag, is_lazy_load=False):
+		VDisplayComp._setup_model.__func__(self, model, scene, scene_flag)
+		self.setup_skin_material_attr()
+
+		if Globals.c_hero.is_in_special_space_island():
+			if Globals.render_mgr.need_hide_role_sfx():
+				from custom.client.Utils import hide_all_model_sfx
+				hide_all_model_sfx(model)
+
+		self.add_to_group(ModelGroup.Unit, scene)
+		model.pickable = True
+		model.scene_flag |= 0x10000000  # 使用动态阴影
+
+		ModelSfxCache.add_base_socket_object(model)
+		if Globals.render_mgr and Globals.render_mgr.render_quality >= 2:
+			model.receive_shadow = False
+		self.add_to_group(ModelGroup.Character, scene)
+
+		self._model.flag |= ModelFlag.CHAR
+
+		quality = 2
+		if Globals.render_mgr:
+			quality = Globals.render_mgr.render_quality
+		if quality >= 2 and not self.close_creature_far_cull:
+			self._model.set_far_cull(True, 110, 105)
+
+		if Globals.render_mgr and Globals.render_mgr.disable_optimize:
+			self._model.set_far_cull(False, 0, 0)
+
+		if self.ctx_is_npc and self.ctx_npc_hide_shadow:
+			self._model.cast_shadow = False
+		#
+		# from public.const_modules.const_fashion import FaceStatus
+		# face_status = FaceStatus.FaceIndex2Status.get(self._face_animation_id, None)
+		# if face_status is not None:
+		# 	self._change_face_status(face_status)
+
+		self.refresh_bind_model_outline()
+
+	def _destroy_model(self):
+		ModelSfxCache.recycle_char_model(self._model)
+		self._model = None
+
+	def on_setup_model(self, model, is_preload_model):
+		VDisplayComp.on_setup_model.__func__(self, model, is_preload_model)
+		self.refresh_bind_model_outline()
+
+	def create_vunit(self):
+		if self._visual_unit is not None:
+			return
+		assert self._model is not None
+		if self._lunit is None:
+			return
+		lunit = self._lunit
+		vm = VisualMgr.instance()
+		vu = vm.AllocateVUnit(2, self.proxy_id)  # CharVUnit
+		self._visual_unit = vu
+		self._init_vunit(vu, lunit)
+
+	def _init_vunit(self, vu, lunit):
+		visual_unit_bind_model_and_phy_body(vu, self._model, lunit.phy_body)
+
+		model_scale = self._model.scale.x
+		vu.fling_sphere_radius = float(lunit.fling_sphere_radius) * model_scale
+		vu.fling_model_center = math3d.vector(*lunit.fling_model_center) * model_scale
+		vu.fling_model_bias = math3d.vector(*lunit.fling_model_bias) * model_scale
+		self._enable_soft_body(vu)
+
+	def _enable_soft_body(self, vu):
+		if self.can_use_soft_body() and self._lunit:
+			quality = 2
+			if Globals.render_mgr:
+				quality = Globals.render_mgr.render_quality
+			enable_sb = False
+			if quality <= 0 or vu.focused:
+				enable_sb = True
+		else:
+			enable_sb = False
+		vu.SetSoftBodyEnabled(enable_sb)
+		return enable_sb
+
+	def free_vunit(self):
+		if self._visual_unit:
+			self._visual_unit.ClearPlayRunSfxCallback()
+		VDisplayComp.free_vunit.__func__(self)
+
+	def __rebind_unit_on_hallreset__(self, content):
+		if not self._lunit:
+			raise ValueError("岛屿重置异常,VCreatureDisplayComp没有rebind新的lunit")
+		self._init_vunit(self._visual_unit, self._lunit)
+		self.create_soft_body_simulator()
+		self.ability_comp_clear()
+		self.modifier_comp_clear()
+		self.set_display_visible(True)
+		if self.check_reset_fashion_info(content) or self.change_model_id:
+			self.reset_model(content)
+
+	def check_reset_fashion_info(self, info):
+		if not info:
+			return False
+		if self.ctx_model_path != info.get('Path', ''):
+			return True
+		return False
+
+	def get_char_position(self):
+		visual_unit = self._visual_unit
+		if visual_unit:
+			if visual_unit.GetTickPriority() == 0 and self._model and self._model.valid:
+				return self._model.world_position
+			else:
+				return visual_unit.getModelDisplacePos()
+		else:
+			return math3d.vector(0, 0, 0)
+
+	@__vmsg__
+	def reset_model(self, fashion_info=None):
+		#print ">>>hsj debug reload_model", fashion_info
+		if not self._lunit:
+			return
+		self.change_model_id = 0
+		self.change_anim_res_map_path = ''
+
+		self.ctx_model_path = self.init_model_path
+		if not self.ctx_model_path:
+			self._use_specified_model = False
+		if fashion_info:
+			self.parse_fashion_info(fashion_info)
+
+		self._create_model_reset()
+
+	@__vmsg__
+	def change_fashion_model(self, fashion_info):
+		self.reset_model(fashion_info)
+
+	def _change_model_load_finish(self, new_model, new_graph, graph_inited=False):
+		print 'VCreatureDisplayComp[{}]._change_model_load_finish: {} {}'.format(self, new_model, new_graph)
+		self._clean_char_loader()
+		if not self._lunit or self._lunit.is_destroyed():
+			print 'create model cb but lunit has destoryed'
+			return
+
+		if not new_model or not new_model.valid:
+			print '_change_model_load_finish faild:', new_model, self.ctx_model_path
+			return
+
+		old_model = self._model
+
+		self.clear_old_model_cache(self._model)
+		self._model_load_finish(new_model, new_graph, graph_inited)
+		#new_model.transformation = old_model.transformation
+
+		if self._visual_unit is not None:
+			self._init_vunit(self._visual_unit, self._lunit)
+		else:
+			print '_change_model_load_finish need create vunit'
+			self.create_vunit()
+
+		self.create_soft_body_simulator()
+		self.on_change_model_finished()
+		if old_model is not new_model:
+			ModelSfxCache.recycle_char_model(old_model)
+
+	@__vmsg__
+	def change_model(self, model_id):
+		"""切换蛋仔变成一些奇怪的模型"""
+		if not self._lunit:
+			return
+		if self.change_model_id == model_id:
+			return
+		model_data = modifier_model_data.data.get(model_id, {})
+		model_path = model_data.get('model_path', '')
+		if not model_data or not model_path:
+			model_path = ModelSfxCache._get_model_path(model_id)
+			if not model_path:
+				return
+		graph_path = model_data.get('graph_path', '')
+		anim_res_map_path = model_data.get('anim_res_map_path', '')
+
+		self.eggy_visible = True
+		self.change_model_id = model_id
+		self.change_anim_res_map_path = anim_res_map_path
+		self.change_model_by_path((model_path, graph_path, anim_res_map_path))
+
+	@__vmsg__
+	def change_model_by_path(self, payload):
+		model_path, graph_path, anim_res_map_path = payload
+		if not self._lunit or not model_path:
+			return
+		# 删除了一部分代码，做属性设置的，这边不再保留。self.xxx = ...
+		data = {
+			'Path': model_path,
+			'is_npc': self._lunit.is_npc
+		}
+		self.parse_fashion_info(data) # 原因：剔除配饰
+
+		# 如果没有填graph路径，就不加载graph了\
+		need_graph = True if graph_path else False
+		self._create_model_by_specify(
+			model_path, graph_path, anim_res_map_path, is_async=True,
+			finish_cb=self._change_model_load_finish, change_model_load_finish=None, need_graph=need_graph)
+
+	def clear_old_model_cache(self, old_model):
+		"""切换模型时清除一下旧模型的数据和逻辑"""
+		#lunit = self._lunit
+		self.remove_status_sfx_cache_path()
+
+		self.sfx_comp_before_reset_model(old_model)
+		self.anim_comp_before_reset_model(old_model)
+		self._callComponents('on_clear_old_model', old_model)
+
+	def on_change_model_finished(self):
+		"""切换成新模型进行一些逻辑处理"""
+		if not self._lunit:
+			return
+		lunit = self._lunit
+
+		self.anim_comp_on_model_loaded()
+		self.spring_comp_on_reset_model()
+		self.sfx_comp_on_reset_model()
+		self.char_move_status_comp_on_reset_model()
+		self._callComponents('on_reset_model')
+
+		self.ability_comp_on_reset_model()
+		self.bind_parent_comp_on_reset_model()
+		self.swim_comp_on_reset_model()
+
+		if lunit.is_frozen or lunit.is_ice_ball:
+			self.set_animation_rate(0.0)
+		else:
+			self.set_animation_rate(1.0)
+
+		self.reset_status_sfx()
+		self.modifier_comp_on_model_change()
+
+		self.char_misc_comp_on_reset_model()
+
+		self.display_comp_set_camp_color(self.ctx_camp_id)
+
+	@__vmsg__
+	def set_need_standup(self, v):
+		if self._visual_unit:
+			self._visual_unit.need_standup = v
+
+	@__vmsg__
+	def set_fling_rotation_scale(self, s):
+		if self._visual_unit:
+			self._visual_unit.fling_rotation_scale = s
+
+	@__vmsg__
+	def receive_control_state_change_msg(self, payload):
+		Globals.g_ui_manager.receive_msg(UIData.CONTROL_STATE_CHANGE, *payload[0], **payload[1])
+
+	@__vmsg__
+	def display_comp_set_camp_color(self, camp_id):
+		if not self._model or not camp_id:
+			return
+		self.ctx_camp_id = camp_id
+		color = self.blackbox.camp_mgr.get_camp_color(camp_id)
+		color = [v / 255.0 for v in color]
+		self.display_comp_set_color(color)
+
+	@__vmsg__
+	def display_comp_set_color(self, color):
+		change_camp_color(self._model, color)
+		self.virtual_change_camp_color(color)
+
+	def virtual_change_camp_color(self, color):
+		pass
+
+	def enable_shadow_fading(self, enable):
+		model = self._model if enable else None
+		scene = get_main_scene()
+		set_shadow_fading_base_obj(scene, model)
+
+	def render_see_through(self, enable):
+		if self._model and self._model.valid:
+			Globals.render_mgr and Globals.render_mgr.set_model_see_through_enable(enable, self._model)
+			enable_render_after_see_through(self._model, enable)
+		self.bind_model_mgr and self.bind_model_mgr.render_see_through(enable)
+
+	def set_see_through_color(self, color):
+		if self._model and color:
+			format_color = (int(color[:2], 16) / 255., int(color[2:4], 16) / 255., int(color[4:], 16) / 255., 0.4)
+			self.render_see_through(True)
+			set_model_material_var(self._model, SEE_THROUGH_COLOR[0], SEE_THROUGH_COLOR[1], format_color)
+
+	def reset_see_through_color(self):
+		if self._model:
+			if Globals.g_vuproxy and self.proxy_id == Globals.g_vuproxy.proxy_id:
+				set_model_material_var(self._model, SEE_THROUGH_COLOR[0], SEE_THROUGH_COLOR[1],
+					DEFAULT_RENDER_THROUGH_COLOR)
+			else:
+				self.render_see_through(False)
+
+	def set_model_shadow(self, enable_shadow):
+		VDisplayComp.set_model_shadow.__func__(self, enable_shadow)
+
+	@__vmsg__
+	def set_model_alpha(self, alpha_value):
+		VDisplayComp.set_model_alpha.__func__(self, alpha_value)
+
+	def set_sub_model_material_param(self, hash_param, name, value):
+		pass
+
+	def reset_sub_model_material_param(self, hash_param, name, value):
+		pass
+
+	@__vmsg__
+	def set_model_mat(self, mtg_path):
+		VDisplayComp.set_model_mat.__func__(self, mtg_path)
+
+	@__vmsg__
+	def reset_model_mat(self):
+		VDisplayComp.set_model_mat.__func__(self, None)
+
+	def set_bind_model_mat(self, mtg_path):
+		if not self.bind_model_id_dict:
+			return
+		if mtg_path:
+			if mtg_path not in self.material_group_data_cache:
+				self.material_group_data_cache[mtg_path] = render.material_group_data(mtg_path)
+			replace_mtg = self.material_group_data_cache[mtg_path]
+		else:
+			replace_mtg = None
+		if not replace_mtg and not self.is_binded_model_change_material:
+			# 不替换也不需要还原材质
+			return
+		for model_id in self.bind_model_id_dict:
+			model_obj = self.get_binded_model(model_id)
+			if not model_obj:
+				continue
+			original_mtg = self.get_binded_model_original_mtg(model_id)
+			change_models, change_mtgs = [model_obj], [original_mtg]
+			children = get_all_merge_model(model_obj)
+			if children:  # 加入合并组件的模型&原材质
+				merge_model_mtgs = self.get_binded_merge_model_original_mtg(model_id)
+				if len(children) == len(merge_model_mtgs):
+					change_models.extend(children)
+					change_mtgs.extend(merge_model_mtgs)
+			for op_model, op_mtg in zip(change_models, change_mtgs):
+				mtg, ori_sub_mats = op_mtg
+				if replace_mtg:
+					set_model_mtg_by_target(op_model, mtg, replace_mtg, ori_sub_mats)
+				elif self.is_binded_model_change_material:
+					set_model_mtg_by_sub_mats(op_model, mtg, ori_sub_mats)
+		self.is_binded_model_change_material = replace_mtg is not None
+
+	def reset_bind_model_mat(self):
+		self.set_bind_model_mat(None)
+
+	def set_visible_mtg_val(self, v1, v2):
+		set_model_material_var(self._model, SHP_FRESNEL_STRENGTH[0], SHP_FRESNEL_STRENGTH[1], v1)
+		set_model_material_var(self._model, SHP_NORMAL_INTENSITY[0], SHP_NORMAL_INTENSITY[1], v2)
+
+	def set_model_material_dark_val(self, val):
+		set_model_material_var(self._model, SHP_COLOR_DARK[0], SHP_COLOR_DARK[1], val)
+
+	@__vmsg__
+	def create_text_bubble(self, text):
+		if isinstance(text, str):
+			keep_time = None
+		else:
+			text, keep_time = text
+		if self._lunit:
+			if keep_time is not None:
+				Globals.model.create_bubble(self._lunit.unit_id, show_msg=text, keep_time=keep_time)
+			else:
+				Globals.model.create_bubble(self._lunit.unit_id, show_msg=text)
+
+	def change_model_lod(self, lst):
+		#lst 代表lod0-2按照距离排序的最大值及最小值
+		all_sub_objs = self._model.get_all_objects_on_sockets()
+		for obj in all_sub_objs:
+			#1为按距离划分，比较适合指定的lod模型 2为按屏幕距离划分
+			#针对1：
+			#在DoGetDistanceLODLevel方法中，它判断当前细节级别是否为最高级别（即cur_level等于m_levels.size()）。
+			# 如果是，则检查距离平方v是否大于等于前一个细节级别的结束距离平方值（即m_levels[cur_level - 1].GetEndSqr()），
+			# 如果是，则返回当前细节级别；否则将当前细节级别减1，并重复此过程直到找到适当的细节级别并返回其索引。
+			lod_profile = obj.get_lod_profile()
+			lod_profile.set_divide_type(1)
+			lod_profile.init_levels([lst[i:i + 2] for i in xrange(0, len(lst), 2)])
+			obj.refresh_lod()
+
+	def reset_model_lod(self):
+		all_sub_objs = self._model.get_all_objects_on_sockets()
+		for obj in all_sub_objs:
+			obj.reset_lod()
+
+	@__vmsg__
+	def auto_update_visual_scale(self, duration=0):
+		if self._visual_unit and self._lunit:
+			fix_scale = self._lunit.CHAR_SCALE
+			if duration == 0:
+				self.set_model_scale((float(fix_scale), float(fix_scale), float(fix_scale)))
+			self._visual_unit.EnableModelScale(fix_scale, duration)
+			is_in_hall = Globals.c_hero and Globals.c_hero.is_in_hall()
+			self.set_special_variable_cache_float('model_scale', float(fix_scale) if is_in_hall else 1.0)
+
+	@__vmsg__
+	def set_outline(self, payload):
+		width, color = payload
+		color_rgb = color_to_rgb(color)
+		self.set_outline_with_vec_color((width, color_rgb))
+
+	@__vmsg__
+	def set_outline_with_vec_color(self, payload):
+		width, color_rgb = payload
+		if self._model:
+			real_color = (color_rgb[0] / 255.0, color_rgb[1] / 255.0, color_rgb[2] / 255.0, 1.0)
+			real_width = float(width)
+			if self.blackbox and self.blackbox.cur_map_version >= MapDataVersionType.VERSION_46:
+				if self.outline_and_mask_mgr:
+					if getattr(self, 'using_ugc_anim_graph', False): # 先用这个来标记ugc生物
+						self.outline_and_mask_mgr.disable_outline(source='api')
+						self.bind_model_mgr and self.bind_model_mgr.set_outline(real_color, real_width)
+					else:
+						self.outline_and_mask_mgr.enable_outline(source='api', color=real_color, width=real_width)
+						cur_outline_params = self.outline_and_mask_mgr.get_cur_outline_params()
+						cur_mask_params = self.outline_and_mask_mgr.get_cur_mask_params()
+						if self.bind_model_mgr and hasattr(self.bind_model_mgr, 'binded_model_dict'):
+							color = cur_outline_params.get('color', real_color)
+							width = cur_outline_params.get('width', real_width)
+							mask_color = cur_mask_params.get('mask_color', DEFAULT_OUTLINE_MASK_COLOR)
+							# 前面的接口用到simple，这里也要用simple，不然不会合并
+							for model_info in self.bind_model_mgr.binded_model_dict.itervalues():
+								model_obj = model_info[0]
+								set_simple_outline_value(model_obj, color, width, already_enable=True)
+								enable_mask_and_outline(model_obj, True)
+								set_outline_mask_color(model_obj, mask_color)
+			else:
+				set_outline_value(self._model, real_color, real_width)
+				self.bind_model_mgr and self.bind_model_mgr.set_outline(real_color, real_width)
+
+	@__vmsg__
+	def disable_outline(self, payload=None):
+		if self._model:
+			if self.blackbox and self.blackbox.cur_map_version >= MapDataVersionType.VERSION_46:
+				if self.outline_and_mask_mgr:
+					self.outline_and_mask_mgr.disable_outline(source='api')
+					if not self.bind_model_mgr or not hasattr(self.bind_model_mgr, 'binded_model_dict'):
+						return
+					cur_outline_params = self.outline_and_mask_mgr.get_cur_outline_params()
+					cur_mask_params = self.outline_and_mask_mgr.get_cur_mask_params()
+					if cur_outline_params:
+						if cur_outline_params.get('use_simple', True):
+							color = cur_outline_params.get('color')
+							width = cur_outline_params.get('width')
+							mask_color = cur_mask_params.get('mask_color', DEFAULT_OUTLINE_MASK_COLOR)
+							for model_info in self.bind_model_mgr.binded_model_dict.itervalues():
+								model_obj = model_info[0]
+								set_simple_outline_value(model_obj, color, width, already_enable=True)
+								enable_mask_and_outline(model_obj, True)
+								set_outline_mask_color(model_obj, mask_color)
+							self.bind_model_mgr.disable_outline()
+						else:
+							for model_info in self.bind_model_mgr.binded_model_dict.itervalues():
+								model_obj = model_info[0]
+								enable_mask_and_outline(model_obj, False)
+							self.bind_model_mgr.set_outline(cur_outline_params.get('color'), cur_outline_params.get('width'))
+					elif cur_mask_params:
+						for model_info in self.bind_model_mgr.binded_model_dict.itervalues():
+							model_obj = model_info[0]
+							enable_mask_and_outline(model_obj, False)
+						self.bind_model_mgr.disable_outline()
+						self.bind_model_mgr.set_mask(cur_mask_params.get('mask_color', DEFAULT_OUTLINE_MASK_COLOR))
+					else:
+						for model_info in self.bind_model_mgr.binded_model_dict.itervalues():
+							model_obj = model_info[0]
+							enable_mask_and_outline(model_obj, False)
+						self.bind_model_mgr.disable_outline()
+			else:
+				enable_outline(self._model, False)
+				self.bind_model_mgr and self.bind_model_mgr.disable_outline()
+
+	def refresh_bind_model_outline(self):
+		if self.blackbox and self.blackbox.cur_map_version >= MapDataVersionType.VERSION_46:
+			if self.outline_and_mask_mgr:
+				cur_params = self.outline_and_mask_mgr.get_cur_outline_params()
+				if cur_params:
+					self.bind_model_mgr and self.bind_model_mgr.set_outline(cur_params.get('color'), cur_params.get('width'))
+				else:
+					self.bind_model_mgr and self.bind_model_mgr.disable_outline()
+		else:
+			self.bind_model_mgr and self.bind_model_mgr.disable_outline()
+
+	@__vmsg__
+	def set_fresnel(self, payload):
+		scale, color, intensity = payload
+		if self._model:
+			self.stop_fresnel_gradual_change()
+			color_rgb = color_to_rgb(color)
+			real_color = (color_rgb[0] / 255.0, color_rgb[1] / 255.0, color_rgb[2] / 255.0, 1.0)
+			scale = float(scale)
+			set_fresnel_value_egg(self._model, scale, real_color, int(intensity))
+			self.bind_model_mgr and self.bind_model_mgr.set_fresnel(scale, (real_color[0], real_color[1], real_color[2]), float(intensity))  # 组件类型的强度需要为float，颜色为rgb
+
+	@__vmsg__
+	def set_fresnel_gradual(self, payload):
+		scale, color, intensity, duration = payload
+		if self._model:
+			self.stop_fresnel_gradual_change()
+			color_rgb = color_to_rgb(color)
+			real_color = (color_rgb[0] / 255.0, color_rgb[1] / 255.0, color_rgb[2] / 255.0)
+			scale = float(scale)
+			intensity = float(intensity)
+			duration = float(duration)
+			self._fresnel_update_properties = {
+				'color': real_color,
+				'scale': scale,
+				'intensity': intensity,
+				'duration': duration,
+			}
+			cur_intensity = get_model_material_var(self._model, SHP_INTENSITY[0], SHP_INTENSITY[1])
+			self._cur_float_fresnel_intensity = 0.0 if not cur_intensity else float(cur_intensity[3])
+			self._fresnel_rendercb_index = Globals.render_cb_mgr.register_render_callback(self.update_fresnel_gradual_change, 3)
+
+	def update_fresnel_gradual_change(self, *args):
+		if not self._fresnel_update_properties or not self._model:
+			self.stop_fresnel_gradual_change()
+			return
+		dt = 3.0 / Globals.frame_rate
+		if 'duration' in self._fresnel_update_properties:
+			duration = self._fresnel_update_properties['duration']
+			p = min(1, dt / duration) if duration > 0 else 1.
+			self._fresnel_update_properties['duration'] -= dt
+			gradual_color = None
+			if 'color' in self._fresnel_update_properties:
+				target_color = self._fresnel_update_properties['color']
+				cur_color = get_model_material_var(self._model, SHP_RimColor[0], SHP_RimColor[1])
+				if cur_color is None:
+					cur_color = (0.0, 0.0, 0.0)
+				gradual_color = (
+					cur_color[0] * (1 - p) + target_color[0] * p,
+					cur_color[1] * (1 - p) + target_color[1] * p,
+					cur_color[2] * (1 - p) + target_color[2] * p,
+				)
+				set_model_material_var(self._model, SHP_RimColor[0], SHP_RimColor[1], gradual_color)
+			gradual_scale = None
+			if 'scale' in self._fresnel_update_properties:
+				target_scale = self._fresnel_update_properties['scale']
+				cur_scale = get_model_material_var(self._model, SHP_FRESNEL_SCALE[0], SHP_FRESNEL_SCALE[1])
+				if cur_scale is None:
+					cur_scale = 0.0
+				gradual_scale = cur_scale * (1 - p) + target_scale * p
+				set_model_material_var(self._model, SHP_FRESNEL_SCALE[0], SHP_FRESNEL_SCALE[1], gradual_scale)
+			gradual_intensity = None
+			if 'intensity' in self._fresnel_update_properties:
+				target_intensity = self._fresnel_update_properties['intensity']
+				gradual_intensity = self._cur_float_fresnel_intensity * (1 - p) + target_intensity * p
+				print(self._cur_float_fresnel_intensity)
+				self._cur_float_fresnel_intensity = gradual_intensity
+				mtg = render.material_group_data(self._model.get_material_group_data())
+				for i in xrange(mtg.count):
+					submat = self._model.get_sub_material(i)
+					if not submat:
+						continue
+					ori_intensity = submat.get_var(SHP_INTENSITY[0], SHP_INTENSITY[1])
+					if ori_intensity:
+						set_model_material_var(self._model, SHP_INTENSITY[0], SHP_INTENSITY[1], (ori_intensity[0], ori_intensity[1], ori_intensity[2], int(round(gradual_intensity))))
+			if gradual_scale is not None and gradual_intensity is not None and gradual_color is not None:
+				self.bind_model_mgr and self.bind_model_mgr.set_fresnel(gradual_scale, (gradual_color[0], gradual_color[1], gradual_color[2]), gradual_intensity)
+			if self._fresnel_update_properties['duration'] <= 0:
+				self.stop_fresnel_gradual_change()
+		else:
+			self.stop_fresnel_gradual_change()
+
+	def stop_fresnel_gradual_change(self):
+		self._fresnel_rendercb_index and Globals.render_cb_mgr.unregister_render_callback(self._fresnel_rendercb_index)
+		self._fresnel_rendercb_index = None
+		self._fresnel_update_properties = None
+
+	@__vmsg__
+	def disable_fresnel(self, payload=None):
+		if self._model:
+			self.stop_fresnel_gradual_change()
+			reset_fresnel_value_egg(self._model)
+			self.bind_model_mgr and self.bind_model_mgr.disable_fresnel()
+
+	@__vmsg__
+	def set_mask(self, payload):
+		color = payload[0]
+		if self._model:
+			color_rgb = color_to_rgb(color)
+			real_color = (color_rgb[0] / 255.0, color_rgb[1] / 255.0, color_rgb[2] / 255.0, 1.0)
+			if self.outline_and_mask_mgr:
+				self.outline_and_mask_mgr.enable_mask('default', real_color)
+				cur_mask_params = self.outline_and_mask_mgr.get_cur_mask_params()
+				self.bind_model_mgr and self.bind_model_mgr.set_mask(cur_mask_params.get('mask_color'))
+			else:
+				set_outline_mask_color(self._model, real_color)
+				self.bind_model_mgr and self.bind_model_mgr.set_mask(real_color)
+
+	@__vmsg__
+	def disable_mask(self, payload=None):
+		if self._model:
+			if self.outline_and_mask_mgr:
+				self.outline_and_mask_mgr.disable_mask('default')
+				cur_mask_params = self.outline_and_mask_mgr.get_cur_mask_params()
+				if cur_mask_params:
+					self.bind_model_mgr and self.bind_model_mgr.set_mask(cur_mask_params.get('mask_color'))
+				else:
+					self.bind_model_mgr and self.bind_model_mgr.disable_mask()
+			else:
+				enable_mask(self._model, False)
+				self.bind_model_mgr and self.bind_model_mgr.disable_mask()
+
+	@__vmsg__
+	def set_see_through(self, payload):
+		enable = payload[0]
+		if self._model and self._model.valid:
+			Globals.render_mgr and Globals.render_mgr.set_model_see_through_enable(enable, self._model)
+			enable_render_after_see_through(self._model, enable)
+		self.bind_model_mgr and self.bind_model_mgr.render_see_through_all(enable)
+		# self.render_see_through(enable)  # 原接口不会对绑定的子物体操作
